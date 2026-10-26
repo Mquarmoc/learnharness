@@ -598,3 +598,28 @@ body {
 	outline: 1px solid var(--border);
 	border-radius: 0.25rem;
 }
+
+/* Companion chrome and touch sizing do not change the desktop window. */
+body[data-mobile="true"] { overscroll-behavior: none; }
+body[data-mobile="true"] > div { height: var(--lh-mobile-height, 100dvh); }
+.lh-mobile { height: var(--lh-mobile-height, 100dvh); overflow: hidden; padding-bottom: env(safe-area-inset-bottom); }
+.lh-mobile-nav { padding-top: env(safe-area-inset-top); }
+.lh-mobile main > .h-dvh, .lh-mobile main .h-dvh { height: 100%; }
+.lh-mobile .sidebar-motion, .lh-mobile [data-testid="settings-entry"] { display: none; }
+.lh-mobile [data-testid="setup-cta"], .lh-mobile [data-testid="setup-cta-keys"] { display: none; }
+.lh-mobile button, .lh-mobile [role="button"], .lh-mobile input:not([type="checkbox"]):not([type="radio"]), .lh-mobile select { min-height: 44px; }
+.lh-mobile button:has(> svg:only-child) { min-width: 44px; }
+.lh-mobile :is(input, textarea, select) { font-size: 16px; }
+.lh-mobile :is(button, a, input, textarea, select):focus-visible { outline: 2px solid #a8c9ff; outline-offset: 2px; }
+@media (max-width: 640px) {
+	.lh-mobile .lh-wco-gutter { gap: 8px; min-height: 60px; height: auto; padding-top: 8px; padding-bottom: 8px; flex-wrap: wrap; }
+	.lh-mobile .lh-wco-gutter > button.font-title { font-size: 20px; max-width: 100%; }
+	.lh-mobile [data-testid="composer"] textarea { min-width: 0; }
+	.lh-mobile :is(pre, table) { max-width: 100%; overflow-x: auto; }
+	.lh-mobile .font-prose { overflow-wrap: anywhere; }
+}
+
+.lh-mobile [data-testid="model-control"], .lh-mobile [data-testid="dictation-toggle"] { display: none; }
+
+.lh-mobile .text-xs { font-size: 12px; }
+.lh-mobile [data-testid="confidence-track"], .lh-mobile [data-testid="confidence-slider"] { height: 44px; }

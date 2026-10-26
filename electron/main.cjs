@@ -29,6 +29,7 @@ const { createChatGPT, fileStore } = require("./chatgpt.cjs");
 const { attachChatGPTChild, trustedSender, chatGPTControl } = require("./chatgpt-ipc.cjs");
 const { createSubscriptions, loadSubscriptionSDK } = require("./subscriptions.cjs");
 const { attachSubscriptionChild, subscriptionControl } = require("./subscription-ipc.cjs");
+const { createMobileCompanion } = require("./mobile-companion.cjs");
 const { desktopAPIHeaders } = require("./desktop-api.cjs");
 const { randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
@@ -140,6 +141,8 @@ let subscriptions = null;
 let subscriptionChild = null;
 // Per-launch request capability, never OAuth tokens and never renderer state.
 let desktopAPISecret = null;
+let mobileCompanion = null;
+let ownedServerURL = null;
 const trustedAppWindows = new Set();
 
 // A GUI shell must never die to a stray exception (EPIPE dialogs, a race
@@ -262,6 +265,8 @@ function waitUntilUp(url, tries = 150) {
 }
 
 function killServer() {
+	mobileCompanion?.close().catch(() => {});
+	mobileCompanion = null;
 	chatgpt?.close();
 	subscriptions?.close();
 	if (!serverProcess) return;
@@ -524,6 +529,32 @@ function applyZoom(win, factor) {
 
 /** macOS needs an application menu with the Edit roles — without one,
  *  Cmd+C/V/A do nothing in the renderer. Everything else stays minimal. */
+async function mobileMenu() {
+    if (mobileCompanion) {
+        const choice = await dialog.showMessageBox({ message: "Mobile companion is enabled", detail: "A new code replaces the previous unused code. Disconnect all phones also ends active streams.", buttons: ["New pairing code", "Disconnect all phones", "Disable companion", "Cancel"], cancelId: 3 });
+        if (choice.response === 3) return;
+        if (choice.response === 1) { mobileCompanion.revoke(); return; }
+        if (choice.response === 2) { await mobileCompanion.close(); mobileCompanion = null; return; }
+    } else {
+        if (!desktopAPISecret || !process.env.LH_MOBILE_ORIGIN) {
+            await dialog.showMessageBox({ message: "Private mobile access needs setup", detail: "Run the packaged desktop host with LH_MOBILE_ORIGIN set to your private HTTPS origin, and route Tailscale Serve to LH_MOBILE_PORT (default 8792). See docs/mobile-companion.md. Development servers cannot reuse desktop ChatGPT sign-in." });
+            return;
+        }
+        const approval = await dialog.showMessageBox({ type: "warning", message: "Use a dedicated hostname", detail: "Phone sessions use browser cookies. This hostname must serve only LearnHarness, on every port. Other apps on the same hostname could receive the phone credential. Keep this feature disabled on a shared host.", buttons: ["This hostname is dedicated to LearnHarness", "Cancel"], defaultId: 1, cancelId: 1 });
+        if (approval.response !== 0) return;
+        try {
+            const companion = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN });
+            await companion.listen(Number(process.env.LH_MOBILE_PORT || 8792));
+            mobileCompanion = companion;
+        } catch (error) {
+            await dialog.showMessageBox({ type: "error", message: "Could not enable mobile companion", detail: String(error.message) });
+            return;
+        }
+    }
+    const pairing = mobileCompanion.issuePairing();
+    await dialog.showMessageBox({ message: "Connect your phone", detail: "Open " + process.env.LH_MOBILE_ORIGIN + "/pair on your phone.\n\nCode: " + pairing.code + "\n\nWorks once; expires in 10 minutes. Keep this PC awake and LearnHarness open. Only share this code with your own phone." });
+}
+
 function installMenu() {
 	const template = [
 		{
@@ -533,6 +564,7 @@ function installMenu() {
 				// Manual check (Wave C): answers via native dialog — no renderer
 				// round-trip. The 24h automatic checks stay silent.
 				{ label: "Check for Updates…", click: () => checkForUpdates({ manual: true }) },
+				{ label: "Mobile companion…", click: () => mobileMenu().catch((error) => log("mobile companion: " + error.message)) },
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
@@ -595,6 +627,7 @@ async function main() {
 	// (guards, menu, single instance).
 	const devUrl = process.env.LH_DEV_URL;
 	const url = devUrl ?? `http://127.0.0.1:${await freePort()}`;
+	ownedServerURL = url;
 	if (!devUrl) {
 		desktopAPISecret = randomBytes(32).toString("hex");
 		const ownedOrigin = new URL(url).origin;

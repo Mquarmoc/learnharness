@@ -40,6 +40,10 @@ Future teaching sessions can read the graph instead of starting from scratch. Pr
 
 ![LearnHarness knowledge graph](docs/assets/knowledge-graph.png)
 
+## Experimental phone companion
+
+This fork adds private phone access to desktop lessons and practice. Read the [mobile setup and validation limits](docs/mobile-companion.md) before enabling it. Real learning requires a dedicated HTTPS hostname; the shared-host preview contains sample data and scripted replies only.
+
 ## Download and get started
 
 **[Download from learnharness.ai](https://learnharness.ai)** · [GitHub Releases](https://github.com/amosblomqvist/learnharness/releases)
