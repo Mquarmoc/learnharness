@@ -51,6 +51,7 @@ const PRODUCT_NAME = "LearnHarness";
 // Must run before the LH_DEV_URL suffix below — dev becomes
 // "LearnHarness-dev".
 app.setName(PRODUCT_NAME);
+if (process.env.LH_USER_DATA_DIR) app.setPath("userData", path.resolve(process.env.LH_USER_DATA_DIR));
 const AUTH_FILE = () => path.join(app.getPath("userData"), "auth.json");
 const DATA_DIR = () => path.join(app.getPath("userData"), "data");
 
@@ -142,7 +143,21 @@ let subscriptionChild = null;
 // Per-launch request capability, never OAuth tokens and never renderer state.
 let desktopAPISecret = null;
 let mobileCompanion = null;
+let mobileControlWatcher = null;
 let ownedServerURL = null;
+function mobilePairing() {
+    const pairing = mobileCompanion.issuePairing();
+    if (process.env.LH_MOBILE_PAIRING_FILE) fs.writeFileSync(process.env.LH_MOBILE_PAIRING_FILE, JSON.stringify(pairing), { mode: 0o600 });
+    if (process.env.LH_MOBILE_PAIRING_FILE) void chatgpt?.status().then((status) => {
+        fs.writeFileSync(path.join(path.dirname(process.env.LH_MOBILE_PAIRING_FILE), "connection-status.json"), JSON.stringify({
+            available: status.available, error: status.error, catalogError: status.catalogError,
+            accountCount: status.accounts.length,
+            connectedAccounts: status.accounts.filter((account) => account.connected).length,
+            needsSignIn: status.accounts.some((account) => account.canSignInAgain),
+        }));
+    }).catch(() => {});
+    return pairing;
+}
 const trustedAppWindows = new Set();
 
 // A GUI shell must never die to a stray exception (EPIPE dialogs, a race
@@ -225,6 +240,7 @@ function startServer(port) {
 					LH_DESKTOP_API_SECRET: desktopAPISecret,
 				},
 				stdio: ["ignore", "pipe", "pipe", "ipc"],
+				windowsHide: true,
 			},
 		);
 		serverProcess = child;
@@ -265,6 +281,7 @@ function waitUntilUp(url, tries = 150) {
 }
 
 function killServer() {
+	mobileControlWatcher?.close();
 	mobileCompanion?.close().catch(() => {});
 	mobileCompanion = null;
 	chatgpt?.close();
@@ -480,7 +497,7 @@ function installUpdateNow() {
 }
 
 function setupAutoUpdater() {
-	if (!app.isPackaged) {
+	if (!app.isPackaged || process.env.LH_DISABLE_AUTO_UPDATE === "1") {
 		log("auto-update: dev build — updater disabled");
 		return;
 	}
@@ -534,16 +551,14 @@ async function mobileMenu() {
         const choice = await dialog.showMessageBox({ message: "Mobile companion is enabled", detail: "A new code replaces the previous unused code. Disconnect all phones also ends active streams.", buttons: ["New pairing code", "Disconnect all phones", "Disable companion", "Cancel"], cancelId: 3 });
         if (choice.response === 3) return;
         if (choice.response === 1) { mobileCompanion.revoke(); return; }
-        if (choice.response === 2) { await mobileCompanion.close(); mobileCompanion = null; return; }
+        if (choice.response === 2) { mobileCompanion.revoke(); await mobileCompanion.close(); mobileCompanion = null; return; }
     } else {
         if (!desktopAPISecret || !process.env.LH_MOBILE_ORIGIN) {
             await dialog.showMessageBox({ message: "Private mobile access needs setup", detail: "Run the packaged desktop host with LH_MOBILE_ORIGIN set to your private HTTPS origin, and route Tailscale Serve to LH_MOBILE_PORT (default 8792). See docs/mobile-companion.md. Development servers cannot reuse desktop ChatGPT sign-in." });
             return;
         }
-        const approval = await dialog.showMessageBox({ type: "warning", message: "Use a dedicated hostname", detail: "Phone sessions use browser cookies. This hostname must serve only LearnHarness, on every port. Other apps on the same hostname could receive the phone credential. Keep this feature disabled on a shared host.", buttons: ["This hostname is dedicated to LearnHarness", "Cancel"], defaultId: 1, cancelId: 1 });
-        if (approval.response !== 0) return;
         try {
-            const companion = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN });
+            const companion = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN, stateFile: process.env.LH_MOBILE_STATE_FILE });
             await companion.listen(Number(process.env.LH_MOBILE_PORT || 8792));
             mobileCompanion = companion;
         } catch (error) {
@@ -551,7 +566,7 @@ async function mobileMenu() {
             return;
         }
     }
-    const pairing = mobileCompanion.issuePairing();
+    const pairing = mobilePairing();
     await dialog.showMessageBox({ message: "Connect your phone", detail: "Open " + process.env.LH_MOBILE_ORIGIN + "/pair on your phone.\n\nCode: " + pairing.code + "\n\nWorks once; expires in 10 minutes. Keep this PC awake and LearnHarness open. Only share this code with your own phone." });
 }
 
@@ -678,6 +693,24 @@ async function main() {
 		}
 		return subscriptionControl(command, subscriptions);
 	});
+
+    if (process.env.LH_MOBILE_AUTO_START === "1") {
+        let candidate;
+        try {
+            candidate = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN, stateFile: process.env.LH_MOBILE_STATE_FILE });
+            await candidate.listen(Number(process.env.LH_MOBILE_PORT || 8792));
+            mobileCompanion = candidate;
+            mobilePairing();
+            if (process.env.LH_MOBILE_CONTROL_FILE) {
+                fs.writeFileSync(process.env.LH_MOBILE_CONTROL_FILE, "");
+                mobileControlWatcher = fs.watch(process.env.LH_MOBILE_CONTROL_FILE, () => { if (mobileCompanion) mobilePairing(); });
+            }
+        } catch (error) {
+            await candidate?.close().catch(() => {});
+            mobileCompanion = null;
+            log("mobile startup failed: " + error.message);
+        }
+    }
 
 	installMenu();
 

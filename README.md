@@ -42,7 +42,7 @@ Future teaching sessions can read the graph instead of starting from scratch. Pr
 
 ## Experimental phone companion
 
-This fork adds private phone access to desktop lessons and practice. Read the [mobile setup and validation limits](docs/mobile-companion.md) before enabling it. Real learning requires a dedicated HTTPS hostname; the shared-host preview contains sample data and scripted replies only.
+This fork adds private phone access to the same real desktop lessons, practice and learning graph. Read the [mobile setup and validation limits](docs/mobile-companion.md) for secure browser pairing and automatic Windows startup. The desktop keeps the original learner profile and model connection.
 
 ## Download and get started
 

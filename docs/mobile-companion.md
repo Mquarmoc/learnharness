@@ -1,102 +1,102 @@
-# Experimental mobile companion
+# Mobile companion
 
-Continue a desktop lesson or practice session from a phone browser. The PC remains
-the host: one session store, one learning graph, and the existing desktop model
-connection. Closing LearnHarness or sleeping the PC interrupts phone access.
+Open the **same teaching/practice sessions and learning graph** on the desktop and
+phone. There is one desktop backend and one original learner profile; there is
+no second database, copying or periodic synchronization.
 
-This feature is experimental. Automated security/learning checks and HTTPS probes
-have run; rendered 375px layout, touch/keyboard behavior and a physical phone have
-not been verified because browser automation was blocked. Do not treat the sample
-preview as a live AI tutor.
+The desktop app hosts the model connection. Phone learning input uses the
+desktop's existing provider and allowance. Provider keys, OAuth credentials and
+private IPC leases never go to the phone.
 
-## Private desktop setup
+## Private setup
 
-Use a **dedicated HTTPS hostname that serves only LearnHarness on every port**.
-Browser cookies do not isolate ports. An app on another port of the same hostname
-could receive and replay the phone session cookie. A different port on a shared
-PC hostname is therefore unsuitable for real learning records. Production mode
-rejects explicit non-default HTTPS ports and the desktop asks the operator to
-confirm that the whole hostname is dedicated.
+Use private HTTPS, for example Tailscale Serve routed to the loopback companion
+listener. Keep existing routes, application authentication and tailnet policies.
+Do not enable public Funnel. The phone needs private tailnet access.
 
-For Tailscale, a dedicated Service hostname is one option. Defining a Service and
-approving its host require tailnet administration; do not replace existing Serve
-routes or broaden access rules. See [Tailscale Services](https://tailscale.com/docs/features/tailscale-services).
+Configure the packaged desktop build with:
 
-1. Build this fork using the normal desktop packaging workflow. The installed
-   upstream app does not acquire this feature automatically.
-2. Launch that desktop build with `LH_MOBILE_ORIGIN=https://your-dedicated-host`
-   and optionally `LH_MOBILE_PORT=8792`. Do not put a path or trailing slash in
-   the origin. The companion listener binds only to 127.0.0.1.
-3. Route private HTTPS to that listener. Preserve other apps, authentication,
-   tailnet policies and routes. Never use public Funnel for this feature.
-4. Open **LearnHarness → Mobile companion…** in the desktop application menu.
-   Enable it only after confirming the dedicated hostname. Copy the one-use code
-   shown in the native dialog to `https://your-dedicated-host/pair` on the phone.
-5. Choose an existing session. Model/account setup stays on the desktop.
-   The phone's **Sessions** link replaces the desktop sidebar; **Learning map**
-   opens the shared graph view. Browser “Add to Home Screen” creates a shortcut.
-   There is no offline model execution and no service worker/data cache.
+- `LH_MOBILE_ORIGIN`: exact HTTPS origin, including an optional port, no trailing slash.
+- `LH_MOBILE_PORT`: loopback listener port, default 8792.
+- `LH_USER_DATA_DIR`: optional explicit **existing** LearnHarness profile. The
+  directory contains data/ and the existing connection files. Do not copy keys.
+  This also supports an existing Windows MSIX-virtualized profile.
+- `LH_MOBILE_AUTO_START=1`: start the companion with the desktop.
+- Optional local control paths: `LH_MOBILE_PAIRING_FILE`,
+  `LH_MOBILE_CONTROL_FILE` and `LH_MOBILE_STATE_FILE`.
 
-Codes expire in ten minutes. Browser sessions expire after twelve hours or when
-the desktop restarts. The desktop menu can issue a new code, disconnect every
-phone (including active streams), or stop the listener. **Disconnect phone**
-revokes the current session. At most sixteen browser sessions are retained;
-eviction also terminates that session's streams.
+On Windows, inspect sessions from the actual launcher context before selecting
+a profile: packaged applications can see redirected files merged into the normal
+Roaming path. A scheduled task can see a different set at that same logical path.
+Back up learning records before a deliberate recovery; never overwrite a session
+or copy provider credentials between profiles.
 
-## Security boundary
+Normally, open **LearnHarness → Mobile companion…** on the PC and enter its code
+at `/pair` on the phone. Codes work once and expire in ten minutes. The desktop
+can issue another code, disconnect all phones, or disable the listener.
 
-The Electron main process owns pairing, revocation and the HTTP relay. It injects
-the existing private desktop capability only after authentication and an exact
-route/method allowlist. The original Next proxy and trusted-window header injector
-remain intact. No desktop capability, provider key, ChatGPT credential or IPC lease
-is returned to the phone.
+The phone's **Sessions** link replaces the desktop sidebar. Pick the same saved
+session you use on the PC. **Learning map** opens the shared graph. Account,
+model and import administration stay on the desktop.
 
-The phone can read learning records and submit learning input; those submissions
-can use the desktop's configured model allowance. Keys, provider/account changes,
-global/session model settings, file imports, manual background-job creation and
-session deletion are denied. New API routes are denied until explicitly reviewed.
-GET settings is read-only and contains the existing non-secret settings record.
+## Browser authentication and restart
 
-Requests require the configured host. Writes require the exact origin and
-cross-site fetches are denied. Responses use no-store and deny embedding.
-Revocation/logout/expiry terminate active responses. Pairing is rate limited.
-This is not a security boundary against malware running as the desktop owner or
-against script injection in the learning origin.
+Authentication uses an origin-scoped browser token: scheme, hostname **and port**.
+The service worker attaches it to this origin's navigation, API and SSE requests.
+It never sends it to another origin. Authentication cookies are neither issued
+nor accepted, so other applications on the same hostname's other ports do not
+receive this token.
 
-## Isolated sample preview
+The token is stored in this browser origin's localStorage. Only its hash and
+original expiry are persisted at the optional local state file. It expires after
+twelve hours; restart does not extend that lifetime. With a state file configured,
+phone login survives host restart. Disconnect/revoke is persisted too.
 
-`scripts/preview-mobile.ts` deliberately owns only
-`.fresh-data/mobile-preview`. It seeds short Russian, Luxembourgish and aviation
-examples and injects the repository's faux engine into the real turn handler.
-It never uses a real model connection. All model responses identify themselves
-as scripted. It does not import, copy or alter the installed learner profile.
+The service worker recovers its token from a controlled client after being
+suspended. An uncontrolled or stale navigation receives an empty connection
+shell, never learner data. Invalid sessions return to pairing after one retry.
+Initialization and pairing have deadlines with recovery messages.
 
-Run with `LH_MOBILE_ORIGIN` set to the private preview HTTPS origin:
+“Add to Home Screen” uses the same authenticated browser origin when the browser
+shares that storage; a new browser/profile may require pairing. There is no
+CacheStorage or offline model execution. Learning records and provider credentials
+are not cached by the service worker.
 
-```powershell
-$env:LH_MOBILE_ORIGIN='https://your-pc.your-tailnet.ts.net:8448'
-node node_modules/tsx/dist/cli.mjs scripts/preview-mobile.ts
+## Windows restart setup
+
+`scripts/windows-mobile-host.pyw` is the quiet Task Scheduler launcher. Place it
+beside the packaged LearnHarness.exe with host-config.json:
+
+```json
+{ "profile": "C:\\path\\to\\existing\\LearnHarness", "origin": "https://your-pc.your-tailnet.ts.net:8448", "port": 8792 }
 ```
 
-The preview reserves loopback 8792 (gateway), 8793 (Next) and 8794 (scripted turn
-adapter). Check they are unused first. It permits a shared-host port **only for
-synthetic data**, labels the UI accordingly, and writes a one-use test code to
-`.fresh-data/mobile-preview/pairing.json`. Touch
-`.fresh-data/mobile-preview/request-pairing` to issue a fresh test code. That is
-a local test control, never an HTTP administration endpoint.
+Register a limited current-user **At log on** task executing pythonw.exe directly,
+with this launcher as its argument and this directory as working directory.
+Avoid virtual-environment launchers that start a detached second Python process.
+Use IgnoreNew, no execution time limit and bounded restart-on-failure settings.
+This starts after Windows sign-in; it does not provide service before sign-in.
 
-Keep the preview running while trying it. Stopping it invalidates all browser
-sessions. Remove only the preview's Serve route when retiring it; preserve other
-routes. No startup task or scheduler is installed.
+The launcher locks out duplicate hosts, creates the app suspended, assigns a
+kill-on-close Windows Job Object, then resumes it. Stopping the task ends its
+owned app/backend process tree. Children use CREATE_NO_WINDOW. A persistent
+Tailscale Serve route remains configured across host restarts.
 
-## Validation
+Use an install directory outside a disposable conversation checkout. Startup and
+connection status files belong in its run/ directory, outside learner data.
+The optional request-pairing control file issues a fresh code when touched.
+The connection status contains booleans/counts and public error text, never tokens.
+Companion startup failure is caught so the desktop can still open.
 
-- `tests/mobile-companion.test.ts`: fail-closed authentication, exact API allowlist,
-  code expiry/reuse/rate limiting, cookie flags, session expiry/logout/revocation,
-  host/origin/header checks and denial of shared-host production configuration.
-- Existing desktop capability, scripted teaching, sidebar and setup interaction
-  tests cover compatibility.
-- `scripts/smoke-mobile-continuity.ts ORIGIN COOKIE_FILE` submits a synthetic quiz
-  answer through private HTTPS, reads the persisted answer and scripted reaction,
-  and verifies the lesson again after reload. It refuses a non-preview host.
-- Five-persona source/HTTP review was performed. Visual/device checks remain open.
+## Validation and limits
+
+Security tests cover authorization, host/origin boundaries, exact route/method
+allowlist, pairing expiry/reuse/rate limiting, persistence/revocation, active stream
+termination, and rejection of legacy authentication cookies. VM browser tests run
+the actual worker/bootstrap scripts. The Windows launcher has an actual Job
+Object termination check.
+
+Rendered 375px layout, physical-phone keyboard and native browser service-worker
+behavior still require real-device validation when browser controls are unavailable.
+The optional preview-mobile.ts script remains an isolated development fixture;
+it is not the real synchronized deployment.

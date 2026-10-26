@@ -1,12 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createRequire } from "node:module";
 const { createMobileCompanion, learningRoute } = createRequire(import.meta.url)("../electron/mobile-companion.cjs");
 const publicOrigin = "https://phone.tail.test";
 const secret = "a".repeat(64);
 
-async function fixture() {
+async function fixture(options: Record<string, unknown> = {}) {
 	const seen: { method?: string; url?: string; headers: http.IncomingHttpHeaders; body: string }[] = [];
 	const backend = http.createServer(async (req, res) => {
 		let body = ""; for await (const chunk of req) body += chunk;
@@ -18,12 +21,12 @@ async function fixture() {
 	await new Promise<void>((resolve) => backend.listen(0, "127.0.0.1", resolve));
 	const target = `http://127.0.0.1:${(backend.address() as { port: number }).port}`;
 	let clock = 1000;
-	const companion = await createMobileCompanion({ target, secret, publicOrigin, now: () => clock });
+	const companion = await createMobileCompanion({ target, secret, publicOrigin, now: () => clock, ...options });
 	const port = await companion.listen();
 	const request = (pathname: string, method = "GET", cookie = "", body = "", headers: Record<string, string> = {}) =>
 		new Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }>((resolve, reject) => {
 			const req = http.request({ hostname: "127.0.0.1", agent: false, port, path: pathname, method, headers: {
-				host: new URL(publicOrigin).host, ...(method !== "GET" ? { origin: publicOrigin } : {}), cookie, ...headers,
+				host: new URL(publicOrigin).host, ...(method !== "GET" ? { origin: publicOrigin } : {}), authorization: cookie, ...headers,
 			} }, (res) => {
 				let data = ""; res.on("data", (chunk) => data += chunk);
 				res.on("end", () => resolve({ status: res.statusCode!, headers: res.headers, body: data }));
@@ -33,11 +36,9 @@ async function fixture() {
 	const pair = async () => {
 		const { code } = companion.issuePairing();
 		const res = await request("/pair", "POST", "", new URLSearchParams({ code }).toString());
-		assert.equal(res.status, 303);
-		const cookies = res.headers["set-cookie"]!;
-		assert.match(cookies[0]!, /Secure; HttpOnly; SameSite=Strict/);
-		assert(!cookies[0]!.includes(secret));
-		return { code, cookie: cookies.map((value) => value.split(";")[0]).join("; ") };
+		assert.equal(res.status, 200);
+		assert.equal(res.headers["set-cookie"], undefined);
+		return { code, cookie: "Bearer " + JSON.parse(res.body).token };
 	};
 	return { companion, request, pair, seen, port, advance: (ms: number) => clock += ms,
 		close: async () => { await companion.close(); backend.closeAllConnections(); await new Promise<void>((resolve) => backend.close(() => resolve())); } };
@@ -47,7 +48,7 @@ test("mobile pairing is required for APIs and SSR pages; admin APIs stay desktop
 	const f = await fixture();
 	try {
 		assert.equal((await f.request("/api/chats")).status, 401);
-		assert.equal((await f.request("/chat/sample")).headers.location, "/pair");
+		assert.match((await f.request("/chat/sample")).body, /mobile-gate/);
 		assert.equal(f.seen.length, 0);
 		const { cookie } = await f.pair();
 		for (const [path, method] of [["/api/keys", "GET"], ["/api/settings/models", "PUT"], ["/api/graph/import", "POST"], ["/api/chats/sample", "DELETE"], ["/api/jobs", "POST"], ["/settings", "GET"], ["/api/unknown", "GET"]]) {
@@ -90,7 +91,7 @@ test("origin/host/encoding checks and header allowlist prevent cross-site and ca
 		assert.equal((await f.request("/api/chats", "GET", cookie, "", { host: "evil.invalid" })).status, 403);
 		assert.equal((await f.request("/api/chats", "GET", cookie, "", { "sec-fetch-site": "cross-site" })).status, 403);
 		for (const path of ["/api/%6beys", "//api/keys", "/api/chats/../keys", "/api\\keys"]) assert.notEqual((await f.request(path, "GET", cookie)).status, 200);
-		const res = await f.request("/api/chat", "POST", cookie, '{"answer":"bonjour"}', { "content-type": "application/json", "x-learnharness-desktop": "forged", authorization: "Bearer forged" });
+		const res = await f.request("/api/chat", "POST", cookie, '{"answer":"bonjour"}', { "content-type": "application/json", "x-learnharness-desktop": "forged", "x-forged-authorization": "Bearer forged" });
 		assert.equal(res.status, 200);
 		const sent = f.seen.at(-1)!;
 		assert.equal(sent.headers["x-learnharness-desktop"], secret);
@@ -114,10 +115,14 @@ test("gateway refuses remote targets, weak capabilities, and non-HTTPS public or
 	}
 });
 
-test("real learner profiles reject a shared-host port; only the isolated synthetic preview permits it", async () => {
-    await assert.rejects(createMobileCompanion({ target: "http://127.0.0.1:3000", secret, publicOrigin: "https://host.tail.test:8448" }), /dedicated HTTPS hostname/);
-    const preview = await createMobileCompanion({ target: "http://127.0.0.1:3000", secret, publicOrigin: "https://host.tail.test:8448", preview: true });
-    await preview.close();
+test("shared-host cookies never authorize access; origin-scoped credentials permit the configured HTTPS port", async () => {
+    const f = await fixture();
+    try {
+        const paired = await f.pair();
+        const token = paired.cookie.slice(7);
+        assert.equal((await f.request("/api/chats", "GET", "", "", { cookie: "__Host-lh-companion=" + token })).status, 401);
+        assert.equal((await f.request("/api/chats", "GET", paired.cookie)).status, 200);
+    } finally { await f.close(); }
 });
 
 test("session-cap eviction and phone logout terminate already-open SSE responses", async () => {
@@ -129,7 +134,7 @@ test("session-cap eviction and phone logout terminate already-open SSE responses
             let closed!: Promise<void>;
             await new Promise<void>((resolve, reject) => {
                 const req = http.get({ hostname: "127.0.0.1", port: f.port, path: "/api/events", agent: false,
-                    headers: { host: new URL(publicOrigin).host, cookie } }, (res) => {
+                    headers: { host: new URL(publicOrigin).host, authorization: cookie } }, (res) => {
                     res.on("error", () => {});
                     closed = new Promise<void>((finish) => res.once("close", finish));
                     res.once("data", () => resolve());
@@ -148,4 +153,25 @@ test("session-cap eviction and phone logout terminate already-open SSE responses
         assert.equal((await f.request("/mobile/logout", "POST", last.cookie)).status, 303);
         await Promise.race([loggedOut.closed, new Promise((_, reject) => setTimeout(() => reject(new Error("Logged-out stream stayed open")), 1000))]);
     } finally { await f.close(); }
+});
+
+test("phone login survives host restart with only a hash persisted, and desktop revocation survives the next restart", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lh-phone-state-"));
+    const stateFile = path.join(dir, "sessions.json");
+    let f = await fixture({ stateFile });
+    try {
+        const { cookie: bearer } = await f.pair();
+        assert(!fs.readFileSync(stateFile, "utf8").includes(bearer.slice(7)));
+        await f.close();
+        f = await fixture({ stateFile });
+        assert.equal((await f.request("/api/chats", "GET", bearer)).status, 200);
+        f.companion.revoke();
+        await f.close();
+        f = await fixture({ stateFile });
+        assert.equal((await f.request("/api/chats", "GET", bearer)).status, 401);
+    } finally {
+        await f.close();
+        assert.equal(path.dirname(dir), path.resolve(os.tmpdir()));
+        fs.rmSync(dir, { recursive: true });
+    }
 });

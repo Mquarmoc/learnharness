@@ -3,11 +3,11 @@ import fs from "node:fs";
 import { buildAnswer, normalizeOptions, resolveCorrect, type QuestionData } from "../src/core/question-core.ts";
 
 const origin = process.argv[2]!;
-const cookieFile = process.argv[3]!;
+const tokenFile = process.argv[3]!;
 assert(origin?.startsWith("https://"));
-assert(cookieFile?.includes("mobile-preview"), "Only synthetic preview cookies may be used.");
-const cookie = fs.readFileSync(cookieFile, "utf8").trim();
-const request = (pathname: string, options: RequestInit = {}) => fetch(origin + pathname, { ...options, headers: { cookie, origin, ...options.headers }, signal: AbortSignal.timeout(15_000) });
+assert(tokenFile?.includes("mobile-preview"), "Only a synthetic preview token may be used.");
+const token = fs.readFileSync(tokenFile, "utf8").trim();
+const request = (pathname: string, options: RequestInit = {}) => fetch(origin + pathname, { ...options, headers: { Authorization: "Bearer " + token, origin, ...options.headers }, signal: AbortSignal.timeout(15_000) });
 const status = await (await request("/mobile/status")).json();
 assert(status.preview, "Refuse to submit anything to a real learner profile.");
 const { chats } = await (await request("/api/chats")).json();

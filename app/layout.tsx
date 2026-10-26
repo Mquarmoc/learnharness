@@ -24,7 +24,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
 	return (
 		<html lang="en" className={`dark ${ui.variable} ${prose.variable}`}>
 			<body className="min-h-dvh antialiased" data-mobile={mobile ? "true" : undefined}>
-			{mobile && <link rel="manifest" href="/manifest.webmanifest" />}
+			{mobile && <><link rel="manifest" href="/manifest.webmanifest" /><script src="/mobile-bootstrap.js" defer /></>}
 			{/* The notification channel rides OUTSIDE everything: sidebar, dock,
 				 and pages all subscribe as the polls retire (push S3, 2026-10-02). */}
 			<ServerEventsProvider>
