@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 def own_process_tree(child):
@@ -75,6 +76,15 @@ def own_process_tree(child):
 
 def main():
     base = Path(__file__).resolve().parent
+    if "--open" in sys.argv:
+        runtime = base / "run"
+        runtime.mkdir(exist_ok=True)
+        (runtime / "request-pairing").write_text("show", encoding="utf-8")
+        # All shortcuts use the same scheduled owner, including after an explicit Quit.
+        subprocess.run([str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"),
+            "/Run", "/TN", "LearnHarness-Mobile-Host"], check=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+        return 0
     config = json.loads((base / "host-config.json").read_text(encoding="utf-8-sig"))
     executable = base / "LearnHarness.exe"
     profile = Path(config["profile"])
@@ -110,17 +120,22 @@ def main():
         if log.exists() and log.stat().st_size > 2_000_000:
             log.replace(runtime / "host.previous.log")
         with log.open("ab") as output:
-            child = subprocess.Popen([str(executable)], cwd=base, env=env, stdin=subprocess.DEVNULL,
-                stdout=output, stderr=output, creationflags=subprocess.CREATE_NO_WINDOW | 0x4)
-            kernel, job = own_process_tree(child)
-            (runtime / "runtime.json").write_text(json.dumps({
-                "pid": child.pid, "startedAt": datetime.now(timezone.utc).isoformat(),
-                "executable": str(executable), "profile": str(profile), "origin": config["origin"],
-            }), encoding="utf-8")
-            try:
-                return child.wait()
-            finally:
-                kernel.CloseHandle(job)
+            # Task Scheduler does not reliably retry application exit codes on this host.
+            for attempt in range(6):
+                child = subprocess.Popen([str(executable), "--mobile-background"], cwd=base, env=env, stdin=subprocess.DEVNULL,
+                    stdout=output, stderr=output, creationflags=subprocess.CREATE_NO_WINDOW | 0x4)
+                kernel, job = own_process_tree(child)
+                (runtime / "runtime.json").write_text(json.dumps({
+                    "pid": child.pid, "startedAt": datetime.now(timezone.utc).isoformat(),
+                    "executable": str(executable), "profile": str(profile), "origin": config["origin"],
+                }), encoding="utf-8")
+                try:
+                    result = child.wait()
+                finally:
+                    kernel.CloseHandle(job)
+                if result == 0 or attempt == 5:
+                    return result
+                time.sleep(5)
 
 if __name__ == "__main__":
     try:

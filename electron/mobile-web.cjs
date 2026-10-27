@@ -101,6 +101,6 @@ self.addEventListener("fetch", (event) => {
 `;
 
 function gatePage() {
-	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect LearnHarness</title><script src="/mobile-bootstrap.js" defer></script></head><body style="background:#141414;color:#eee;font:18px system-ui;padding:24px"><main id="mobile-gate"><p>Connecting to your LearnHarness desktopâ€¦</p><p id="error" role="alert"></p><a style="color:#eee;display:inline-flex;align-items:center;min-height:44px;padding:0 8px" href="/pair">Pair this phone</a></main></body></html>';
+	return '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Connect LearnHarness</title><script src="/mobile-bootstrap.js" defer></script></head><body style="background:#141414;color:#eee;font:18px system-ui;padding:24px"><main id="mobile-gate"><p>Connecting to your LearnHarness desktop...</p><p id="error" role="alert"></p><a style="color:#eee;display:inline-flex;align-items:center;min-height:44px;padding:0 8px" href="/pair">Pair this phone</a></main></body></html>';
 }
 module.exports = { bootstrap, worker, gatePage };

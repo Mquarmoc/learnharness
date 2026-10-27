@@ -75,7 +75,18 @@ Register a limited current-user **At log on** task executing pythonw.exe directl
 with this launcher as its argument and this directory as working directory.
 Avoid virtual-environment launchers that start a detached second Python process.
 Use IgnoreNew, no execution time limit and bounded restart-on-failure settings.
-This starts after Windows sign-in; it does not provide service before sign-in.
+This starts in the background after Windows sign-in; it does not provide service
+before sign-in. Point desktop and Start Menu shortcuts at the same launcher with
+--open: it asks the existing scheduled task to run and shows its window, rather
+than starting an unmanaged second host.
+
+Closing the desktop window hides it while mobile access is enabled. The model
+connection and phone listener stay running. Reopen the normal shortcut to show
+the window. **Quit and stop phone access** deliberately stops the app; the shortcut
+or the next Windows sign-in starts it again. An unexpected backend exit ends the
+host with a failure code. Its existing launcher restarts it after five seconds,
+up to five times; an explicit Quit returns success and stops these retries.
+Task Scheduler retains its separate fallback failure policy.
 
 The launcher locks out duplicate hosts, creates the app suspended, assigns a
 kill-on-close Windows Job Object, then resumes it. Stopping the task ends its

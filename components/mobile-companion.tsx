@@ -17,8 +17,8 @@ export function MobileFrame({ children }: { children: ReactNode }) {
 				if (res.status === 401) { window.location.assign("/pair"); return; }
 				if (!res.ok) throw new Error();
 				const body = await res.json();
-				setStatus(body.preview ? "Test preview · sample lessons · no AI connected" : "Phone paired. Keep LearnHarness open on the PC.");
-			} catch { setStatus("Desktop unavailable. Keep LearnHarness open, then reload."); }
+				setStatus(body.preview ? "Test preview · sample lessons · no AI connected" : "Phone paired. Keep the PC awake; LearnHarness can run in the background.");
+			} catch { setStatus("Desktop unavailable. Start LearnHarness on the PC, then reload."); }
 		};
 		void check();
 		const visible = () => { if (!document.hidden) void check(); };
@@ -60,7 +60,7 @@ export function MobileSessions() {
 			if (!res.ok) throw new Error();
 			const body = await res.json();
 			setChats(body.chats);
-		} catch { setError("Could not load sessions. Keep the PC awake and LearnHarness open, then try again."); }
+		} catch { setError("Could not load sessions. Keep the PC awake and start LearnHarness, then try again."); }
 	}, []);
 	useEffect(() => {
 		void load();

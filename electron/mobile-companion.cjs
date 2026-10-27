@@ -25,7 +25,7 @@ function learningRoute(method, pathname) {
 function pairingPage(error = "", preview = false) {
 	return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#141414"><title>Pair LearnHarness</title>
 <style> *{box-sizing:border-box}body{margin:0;background:#141414;color:#e6e6e6;font:17px/1.5 system-ui;padding:max(24px,env(safe-area-inset-top)) 20px}main{max-width:440px;margin:8vh auto}h1{font-size:30px}p{color:#bbb}label{display:block;margin:24px 0 8px}input,button{font:inherit;border:1px solid #666;border-radius:8px;min-height:48px;width:100%;padding:12px;background:#222;color:inherit}input{font-size:16px}button{margin-top:16px;background:#e6e6e6;color:#141414;font-weight:600;cursor:pointer}:focus-visible{outline:3px solid #a8c9ff;outline-offset:3px}.error{color:#ffb7b7;min-height:26px}.note{border:1px solid #666;padding:12px;border-radius:8px}small{color:#aaa}</style><script src="/mobile-bootstrap.js" defer></script></head><body><main>
-<h1>LearnHarness on your phone</h1><p>Continue learning from your PC. Keep the PC awake and LearnHarness open.</p>
+<h1>LearnHarness on your phone</h1><p>Continue learning from your PC. Keep the PC awake. Closing the desktop window keeps phone access running.</p>
 ${preview ? '<p class="note">Test preview: sample lessons only. No AI account is connected and no model requests are sent.</p>' : ""}
 <form method="post" action="/pair"><label for="code">Pairing code from your desktop</label><input id="code" name="code" required maxlength="24" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="help error"><p id="help"><small>${preview ? "Use the test code supplied with this preview link. If it expires, request a fresh test code." : "On the PC, open LearnHarness → Mobile companion."} Each code works once and expires after 10 minutes.</small></p><p id="error" class="error" role="alert">${error}</p><button disabled>Connect this phone</button><noscript>JavaScript is required to pair this phone securely.</noscript></form><p><small>Private HTTPS access. No password or AI key is needed on this phone. After connecting, you can add this page to your home screen.</small></p></main></body></html>`;
 }
@@ -157,7 +157,7 @@ async function createMobileCompanion({ target, secret, publicOrigin, now = Date.
 			response.pipe(res);
 			response.on("error", () => res.destroy());
 		});
-		relay.on("error", () => { if (!res.headersSent) json(res, 502, { error: "The desktop is unavailable. Keep LearnHarness open, then reload." }); else res.destroy(); });
+		relay.on("error", () => { if (!res.headersSent) json(res, 502, { error: "The desktop is unavailable. Start LearnHarness on the PC, then reload." }); else res.destroy(); });
 		res.on("close", () => relay.destroy());
 		req.pipe(relay);
 	});

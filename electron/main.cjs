@@ -43,6 +43,7 @@ const path = require("node:path");
 const SIDEBAR_AUTOCLOSE = 928;
 
 const PRODUCT_NAME = "LearnHarness";
+let openDesktopOnReady = !process.argv.includes("--mobile-background");
 
 // APP NAME → userData (owner, 2026-10-10): the Application Support dir is
 // exactly "LearnHarness" in dev AND packaged. Packaged Electron would
@@ -124,14 +125,11 @@ if (process.argv.includes("--browser-service")) {
 	if (!app.requestSingleInstanceLock()) {
 		app.quit();
 	} else {
-		app.on("second-instance", () => {
-			const win = BrowserWindow.getAllWindows()[0];
-			if (win) {
-				if (win.isMinimized()) win.restore();
-				win.focus();
-			}
-		});
-		main();
+		app.on("second-instance", showDesktop);
+        main().catch((error) => {
+            log("desktop startup failed: " + error.message);
+            app.exit(1);
+        });
 	}
 }
 
@@ -145,6 +143,15 @@ let desktopAPISecret = null;
 let mobileCompanion = null;
 let mobileControlWatcher = null;
 let ownedServerURL = null;
+function showDesktop() {
+    openDesktopOnReady = true;
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) {
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+    }
+}
 function mobilePairing() {
     const pairing = mobileCompanion.issuePairing();
     if (process.env.LH_MOBILE_PAIRING_FILE) fs.writeFileSync(process.env.LH_MOBILE_PAIRING_FILE, JSON.stringify(pairing), { mode: 0o600 });
@@ -250,6 +257,7 @@ function startServer(port) {
 		child.stdout.on("data", fwd);
 		child.stderr.on("data", fwd);
 		child.on("exit", (code, signal) => {
+            const unexpected = serverProcess === child;
 			log(`server exited (code=${code} signal=${signal})`);
 			serverProcess = null;
 			chatgptChild?.dispose();
@@ -258,26 +266,30 @@ function startServer(port) {
 			subscriptionChild = null;
 			chatgpt?.close();
 			subscriptions?.close();
+            if (unexpected && process.env.LH_MOBILE_AUTO_START === "1") app.exit(1);
 		});
 		resolve(child);
 	});
 }
 
 /** No "ready" event exists — poll until the server answers (docs-confirmed). */
-function waitUntilUp(url, tries = 150) {
-	return new Promise((resolve, reject) => {
-		const attempt = (n) => {
-			const req = http.get(url, (res) => {
-				res.resume();
-				resolve(res.statusCode !== undefined);
-			});
-			req.on("error", () => {
-				if (n <= 0) reject(new Error(`server never answered on ${url}`));
-				else setTimeout(() => attempt(n - 1), 200);
-			});
-		};
-		attempt(tries);
-	});
+function waitUntilUp(url, timeoutMs = 180_000) {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+        const attempt = () => {
+            const req = http.get(url + "/favicon.ico", (res) => {
+                res.resume();
+                resolve(res.statusCode !== undefined);
+            });
+            req.setTimeout(Math.max(1, Math.min(2000, deadline - Date.now())),
+                () => req.destroy(new Error("Startup probe timed out")));
+            req.on("error", () => {
+                if (Date.now() >= deadline) reject(new Error(`server never answered on ${url}`));
+                else setTimeout(attempt, 200);
+            });
+        };
+        attempt();
+    });
 }
 
 function killServer() {
@@ -306,7 +318,7 @@ function killServer() {
  *    default, we do not);
  *  - will-navigate pinned to the app origin; window.open always denied —
  *    external links go to the real browser via shell.openExternal. */
-function createWindow(url) {
+function createWindow(url, background = false) {
 	const win = new BrowserWindow({
 		width: 1440,
 		height: 900,
@@ -408,7 +420,14 @@ function createWindow(url) {
 		event.preventDefault();
 	});
 
-	win.once("ready-to-show", () => win.show());
+    // Closing the desktop window must not pause the phone's model connection.
+    win.on("close", (event) => {
+        if (mobileCompanion) {
+            event.preventDefault();
+            win.hide();
+        }
+    });
+	win.once("ready-to-show", () => { if (!background) win.show(); });
 	return win;
 }
 
@@ -567,7 +586,7 @@ async function mobileMenu() {
         }
     }
     const pairing = mobilePairing();
-    await dialog.showMessageBox({ message: "Connect your phone", detail: "Open " + process.env.LH_MOBILE_ORIGIN + "/pair on your phone.\n\nCode: " + pairing.code + "\n\nWorks once; expires in 10 minutes. Keep this PC awake and LearnHarness open. Only share this code with your own phone." });
+    await dialog.showMessageBox({ message: "Connect your phone", detail: "Open " + process.env.LH_MOBILE_ORIGIN + "/pair on your phone.\n\nCode: " + pairing.code + "\n\nWorks once; expires in 10 minutes. Keep this PC awake. Phone access continues when the desktop window is closed. Only share this code with your own phone." });
 }
 
 function installMenu() {
@@ -584,7 +603,7 @@ function installMenu() {
 				{ role: "hide" },
 				{ role: "hideOthers" },
 				{ type: "separator" },
-				{ role: "quit" },
+				{ role: "quit", label: process.env.LH_MOBILE_AUTO_START === "1" ? "Quit and stop phone access" : "Quit" },
 			],
 		},
 		{ label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
@@ -702,8 +721,16 @@ async function main() {
             mobileCompanion = candidate;
             mobilePairing();
             if (process.env.LH_MOBILE_CONTROL_FILE) {
-                fs.writeFileSync(process.env.LH_MOBILE_CONTROL_FILE, "");
-                mobileControlWatcher = fs.watch(process.env.LH_MOBILE_CONTROL_FILE, () => { if (mobileCompanion) mobilePairing(); });
+                const control = process.env.LH_MOBILE_CONTROL_FILE;
+                if (fs.existsSync(control) && fs.readFileSync(control, "utf8") === "show") showDesktop();
+                fs.writeFileSync(control, "");
+                mobileControlWatcher = fs.watch(control, () => {
+                    if (!mobileCompanion) return;
+                    if (fs.readFileSync(control, "utf8") === "show") {
+                        fs.writeFileSync(control, "");
+                        showDesktop();
+                    } else mobilePairing();
+                });
             }
         } catch (error) {
             await candidate?.close().catch(() => {});
@@ -738,8 +765,9 @@ async function main() {
 	});
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) { chatgpt?.resume(); subscriptions?.resume(); createWindow(url); }
+        else showDesktop();
 	});
-	createWindow(url);
+	createWindow(url, !openDesktopOnReady && Boolean(mobileCompanion));
 	log(`window open: ${url}`);
 	// First update check AFTER the window exists (the downloaded-banner
 	// push needs a listener); dev builds no-op (no autoUpdater).
