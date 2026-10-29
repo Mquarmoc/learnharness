@@ -99,6 +99,24 @@ The optional request-pairing control file issues a fresh code when touched.
 The connection status contains booleans/counts and public error text, never tokens.
 Companion startup failure is caught so the desktop can still open.
 
+## Unpacked desktop authentication check
+
+An unpacked desktop installation must include the locked `jose` package under
+`resources/app/node_modules/jose`. The main process verifies ChatGPT ID tokens
+there; a development checkout or the standalone server payload does not prove
+that this dependency is available to the installed desktop module.
+
+After assembling or updating the installation, run:
+
+```sh
+node scripts/smoke-desktop-auth.mjs C:/path/to/resources/app/electron/chatgpt.cjs
+```
+
+This uses the installed authentication module, synthetic signed credentials and
+an ephemeral loopback callback to check sign-in, rotated-token verification and
+restoring a fresh connection. It reads no real credential store and sends no
+requests to a provider.
+
 ## Validation and limits
 
 Security tests cover authorization, host/origin boundaries, exact route/method
