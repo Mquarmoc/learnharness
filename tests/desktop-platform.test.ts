@@ -20,6 +20,7 @@ function windowOptions(platform: string) {
 		constructor(readonly options: unknown) {}
 		webContents = { on() {}, setWindowOpenHandler() {} };
 		loadURL() {}
+        on() {}
 		once() {}
 	}
 	const electron = {

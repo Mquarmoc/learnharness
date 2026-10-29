@@ -80,18 +80,19 @@ const DialogContext = createContext<{ open: (section?: string, row?: string) => 
 export const AUTO_UPDATE_HINT = "Automatic updates arrive in an upcoming release";
 
 export function SettingsDialogProvider({
-	children,
+	children, disabled = false,
 }: {
-	children: React.ReactNode;
+	children: React.ReactNode; disabled?: boolean;
 }) {
 	const [show, setShow] = useState(false);
 	const [landOn, setLandOn] = useState<SectionId>("keys");
 	const [landOnRow, setLandOnRow] = useState<string | null>(null);
 	const open = useCallback((section?: string, row?: string) => {
+		if (disabled) return;
 		setLandOn(section ? section as SectionId : "keys");
 		setLandOnRow(row ?? null);
 		setShow(true);
-	}, []);
+	}, [disabled]);
 	return (
 		<ChatGPTUIProvider><NativeSubscriptionUIProvider><DialogContext.Provider value={{ open }}>
 			{children}
