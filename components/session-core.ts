@@ -39,6 +39,11 @@ export const TURN_POLL_MS = 500;
 /** Give up waiting (a wake turn can run long) and surface the 409. */
 export const TURN_WAIT_MAX_MS = 30_000;
 
+function isConnectionFailure(error: unknown): boolean {
+	return error instanceof TypeError || (error instanceof Error &&
+		(error.name === "NetworkError" || /^(network error|failed to fetch)$/i.test(error.message)));
+}
+
 export interface SessionModelDeps {
 	/** Injectable fetch (tests); defaults to the global. */
 	fetch?: typeof globalThis.fetch;
@@ -229,6 +234,7 @@ export class SessionModel {
 	private statusValue: SessionStatus = "ready";
 	/** Request/loop failures are transient; provider failures derive from messages. */
 	private errorValue: { message: string } | null = null;
+	private connectionError = false;
 	/** A completed failure from THIS consume, not the previous attempt's record. */
 	private liveFailureId: string | null = null;
 	// The single live consume (POST response or reattach stream): a newer
@@ -294,11 +300,12 @@ export class SessionModel {
 	private setStatus(status: SessionStatus): void {
 		if (status === "submitted") this.liveFailureId = null;
 		this.statusValue = status;
-		this.readyRef = status === "ready";
+		this.readyRef = status === "ready" || status === "error";
 		this.onChange?.();
 	}
 
-	private setError(message: string | null): void {
+	private setError(message: string | null, connectionError = false): void {
+		this.connectionError = message !== null && connectionError;
 		this.errorValue = message === null ? null : { message };
 		this.onChange?.();
 	}
@@ -501,14 +508,14 @@ export class SessionModel {
 			} catch (err) {
 				if (this.consumeAbort !== controller || controller.signal.aborted) return;
 				// Replay only GETs: the accepted learner input must never be resent.
-				if (err instanceof TypeError && attempt < 3) {
+				if (isConnectionFailure(err) && attempt < 3) {
 					this.setStatus("submitted");
 					await delay(this.pollMs * 2 ** attempt, controller.signal).catch(() => {});
 					if (this.consumeAbort !== controller || controller.signal.aborted) return;
 					refetchRecordFirst = true;
 					continue;
 				}
-				this.setError((err as Error).message);
+				this.setError((err as Error).message, isConnectionFailure(err));
 				this.setStatus("error");
 				return;
 			}
@@ -550,7 +557,7 @@ export class SessionModel {
 				throw new Error((await recordRes.text()) || "Phone access refused.");
 			}
 			if (recordRes.ok) {
-				const record = (await recordRes.json()) as { messages?: LhMessage[] };
+				const record = (await recordRes.json()) as { messages?: LhMessage[]; turnInFlight?: boolean };
 				if (this.consumeAbort !== controller) return;
 				if (Array.isArray(record.messages)) {
 					this.mutate(() => {
@@ -558,6 +565,13 @@ export class SessionModel {
 						this.incompleteUsageIds.clear();
 						this.tail = [];
 					});
+					// A settled snapshot already contains the next question; no stream remains to replay.
+					if (record.turnInFlight === false) {
+						this.streamingMessageId = null;
+						this.setStatus("ready");
+						this.onReattachSettled?.();
+						return;
+					}
 				}
 			} else {
 				// The record did not land — restore the clean-slate guard
@@ -765,6 +779,12 @@ export class SessionModel {
 	/** Full snapshot swap (the idle settle sync — server canon). */
 	setMessages(record: LhMessage[]): void {
 		this.mutate(() => {
+			if (this.connectionError) {
+				this.errorValue = null;
+				this.connectionError = false;
+				this.statusValue = "ready";
+				this.readyRef = true;
+			}
 			this.base = record;
 			this.incompleteUsageIds.clear();
 			this.tail = [];
