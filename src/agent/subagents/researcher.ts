@@ -100,6 +100,7 @@ export async function runResearcherAgent(prompt: string, opts: ResearcherRunOpti
 		engine: opts.engine,
 		systemPrompt: INSTRUCTIONS,
 		maxTurns: 12,
+		finalTurnPrompt: "This is your final request. Write the complete research brief now using the sources already gathered. Tools are unavailable. State any gaps honestly; do not invent sources.",
 		abortSignal: opts.abortSignal,
 		onUsage: opts.onUsage,
 		onToolStart: opts.onToolStart,

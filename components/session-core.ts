@@ -84,7 +84,7 @@ async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): Asyn
 	let buf = "";
 	for (;;) {
 		const { done, value } = await reader.read();
-		if (done) return;
+		if (done) throw new TypeError("The turn stream disconnected before completion.");
 		buf += decoder.decode(value, { stream: true });
 		for (;;) {
 			const end = buf.indexOf("\n\n");
@@ -493,6 +493,29 @@ export class SessionModel {
 		this.consumeAbort?.abort();
 		const controller = new AbortController();
 		this.consumeAbort = controller;
+		this.setError(null);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await this.attachStream(refetchRecordFirst, controller);
+				return;
+			} catch (err) {
+				if (this.consumeAbort !== controller || controller.signal.aborted) return;
+				// Replay only GETs: the accepted learner input must never be resent.
+				if (err instanceof TypeError && attempt < 3) {
+					this.setStatus("submitted");
+					await delay(this.pollMs * 2 ** attempt, controller.signal).catch(() => {});
+					if (this.consumeAbort !== controller || controller.signal.aborted) return;
+					refetchRecordFirst = true;
+					continue;
+				}
+				this.setError((err as Error).message);
+				this.setStatus("error");
+				return;
+			}
+		}
+	}
+
+	private async attachStream(refetchRecordFirst: boolean, controller: AbortController): Promise<void> {
 		// REPLAY ONTO A CLEAN SLATE (owner, optimistic round 3, 2026-10-02):
 		// the reattach stream replays the turn from its FIRST event — an
 		// aborted earlier attempt (React StrictMode's simulated remount)
@@ -517,43 +540,42 @@ export class SessionModel {
 			});
 		}
 		this.setStatus("submitted");
-		try {
-			if (refetchRecordFirst) {
-				const recordRes = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}`, {
-					signal: controller.signal,
-				});
-				if (this.consumeAbort !== controller) return;
-				if (recordRes.ok) {
-					const record = (await recordRes.json()) as { messages?: LhMessage[] };
-					if (this.consumeAbort !== controller) return;
-					if (Array.isArray(record.messages)) {
-						this.mutate(() => {
-							this.base = record.messages!;
-							this.incompleteUsageIds.clear();
-							this.tail = [];
-						});
-					}
-				} else {
-					// The record did not land — restore the clean-slate guard
-					// before the replay (no atomic swap is coming).
-					this.mutate(() => {
-						this.incompleteUsageIds.clear();
-						this.tail = [];
-						this.streamingMessageId = null;
-					});
-				}
-			}
-			const res = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, {
+
+		if (refetchRecordFirst) {
+			const recordRes = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}`, {
 				signal: controller.signal,
 			});
 			if (this.consumeAbort !== controller) return;
-			if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
-			await this.consumeStream(res, controller);
-		} catch (err) {
-			if (this.consumeAbort !== controller || (err as Error).name === "AbortError") return; // a newer consume won
-			this.setError((err as Error).message);
-			this.setStatus("error");
+			if (recordRes.status === 401 || recordRes.status === 403) {
+				throw new Error((await recordRes.text()) || "Phone access refused.");
+			}
+			if (recordRes.ok) {
+				const record = (await recordRes.json()) as { messages?: LhMessage[] };
+				if (this.consumeAbort !== controller) return;
+				if (Array.isArray(record.messages)) {
+					this.mutate(() => {
+						this.base = record.messages!;
+						this.incompleteUsageIds.clear();
+						this.tail = [];
+					});
+				}
+			} else {
+				// The record did not land — restore the clean-slate guard
+				// before the replay (no atomic swap is coming).
+				this.mutate(() => {
+					this.incompleteUsageIds.clear();
+					this.tail = [];
+					this.streamingMessageId = null;
+				});
+			}
 		}
+		const res = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, {
+			signal: controller.signal,
+		});
+		if (this.consumeAbort !== controller) return;
+		if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
+		await this.consumeStream(res, controller);
+
 	}
 
 	/**
