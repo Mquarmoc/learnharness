@@ -152,7 +152,8 @@ async function createMobileCompanion({ target, secret, publicOrigin, now = Date.
 		for (const name of ["accept", "content-type", "content-length", "last-event-id", "rsc", "next-router-state-tree", "next-router-prefetch", "next-router-segment-prefetch", "next-url"]) {
 			if (req.headers[name]) headers[name] = req.headers[name];
 		}
-		const relay = http.request(new URL(req.url, upstream), { method: req.method, headers }, (response) => {
+		// A stale pooled local socket can reset an answer POST; open a fresh connection instead of replaying it.
+		const relay = http.request(new URL(req.url, upstream), { method: req.method, headers, agent: false }, (response) => {
 			const responseHeaders = { ...response.headers, "cache-control": "no-store", "referrer-policy": "no-referrer",
 				"content-security-policy": "frame-ancestors 'none'", "x-content-type-options": "nosniff" };
 			delete responseHeaders["set-cookie"];
