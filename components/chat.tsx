@@ -1,7 +1,6 @@
 "use client";
 
 import { createContext, Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { bindDockTouchScroll } from "@/lib/dock-touch-scroll";
 import { useMobileCompanion } from "@/components/mobile-companion";
 import { useChatSession } from "@/components/session";
 import { visibleQueuedSteers } from "@/components/session-core";
@@ -227,6 +226,7 @@ export function Chat({
 	 *  only decides whether the pill rides the composer. */
 	initialConfigured?: boolean;
 }) {
+	const mobile = useMobileCompanion();
 	// Reattach plumbing (background-turn runner wave): the hook holds the
 	// settled terminal's callback — a stable ref assigned below, once
 	// syncFromServer exists (refs, not closures: no stale capture).
@@ -1171,6 +1171,83 @@ export function Chat({
 		doSend();
 	};
 
+	const dock = (
+		<DockOverlay
+			pending={pending}
+			practice={activeProblem}
+			compactionRunning={compacting}
+			onSubmitThinking={submitThinking}
+			chatId={chatId}
+			plan={hasPlan ? <PlanMarginalia messages={messages} /> : undefined}
+			onOpenPlan={() => setPlanOpen(true)}
+			requiresReveal={requiresReveal}
+			readingThinking={readingThinking}
+			onReadingThinking={applyReadingThinking}
+			phase={phases.at(-1) ?? "probe"}
+			turns={turns}
+			contextTokens={contextTokens}
+			pricing={pricing}
+			onReserve={setDockReserve}
+			dictationSlot={<DictationBar dictation={dictation} />}
+			dictationCancel={dictation.cancel}
+			queuedSteers={visibleQueuedSteers(steerQueue, nativeMessages)}
+			setupCta={
+				zeroKeys ? (
+					<ZeroKeysPill onOpen={() => setSetupOpen(true)} />
+				) : (
+					!configured && (
+						<div className="pointer-events-auto mb-2 flex justify-center">
+							<button
+								type="button"
+								data-testid="setup-cta"
+								onClick={() => setSetupOpen(true)}
+								className="rounded-sm border border-border bg-card px-3 py-1.5 font-ui text-xs text-foreground transition-colors hover:border-muted-foreground/50 hover:bg-accent cursor-pointer"
+							>
+								Set up your models
+							</button>
+						</div>
+					)
+				)
+			}
+			composer={
+				<Composer
+					// Stop aborts ANY in-flight turn (stream-reattach wave): the
+					// square renders while a reattached/wake turn runs too — the
+					// abort channel kills it server-side; stop() alone would
+					// only detach our view.
+					busy={busy}
+					value={text}
+					onChange={applyText}
+					inputRef={composerInputRef}
+					onSend={onSend}
+					onStop={abortInFlightTurn}
+					canSend={canSend}
+					onEscape={dictation.active ? dictation.cancel : undefined}
+					// The pause affordance (owner round 16): the placeholder
+					// IS the hint — empty state, exactly where Enter-on-empty
+					// applies.
+					nextProblem={nextReady}
+					onNext={sendNext}
+					placeholder={nextReady ? "Ask anything, or press Enter for the next one." : undefined}
+				/>
+			}
+			onSubmitAnswer={(output) => {
+				if (!pending) return;
+				// THE ANSWER IS THE QUESTION CALL'S TOOL RESULT (fork 1, owner
+				// 2026-09-26): one input event, one turn — the hook appends
+				// the optimistic graded result (the AnsweredCard shows at
+				// once) and the server's write-ahead persists it before the
+				// turn; the teacher's reaction streams below it. Dismissals
+				// ride the same callback (QuestionAnswerData.dismissed). The
+				// reading-thinking draft rides along (owner 2026-10-03) — the
+				// check answer is its only carrier.
+				const reading = readingThinkingRef.current.trim() || undefined;
+				clearReadingThinking();
+				submitAnswer(pending.tool, pending.toolCallId, reading ? { ...output, readingThinking: reading } : output);
+			}}
+		/>
+	);
+
 	return (
 		<ChatActionsContext.Provider
 			value={{
@@ -1319,7 +1396,7 @@ export function Chat({
 				<div ref={sessionFindScopeRef} className="relative flex min-h-0 flex-1">
 				<Conversation className="h-full min-w-0 flex-1" initial="instant" contextRef={scrollContextRef}>
 					<SessionMessageNavigation />
-					<ConversationContent className="min-h-full gap-0 p-0">
+					<ConversationContent className="min-h-full gap-0 p-0" scrollClassName={mobile ? "lh-session-scroll" : undefined}>
 						<div data-session-find-root="" className={`${COLUMN} flex flex-1 flex-col gap-4 pt-4`}>
 							{messages.length === 0 && !busy && (
 								<ConversationEmptyState
@@ -1588,88 +1665,10 @@ export function Chat({
 						    the overlay — the flow-space replacement for the old
 						    sticky dock. Zero only pre-measurement (the first layout
 						    effect reports before paint). */}
-						<div aria-hidden data-testid="dock-spacer" style={{ height: dockReserve }} />
+						{mobile ? dock : <div aria-hidden data-testid="dock-spacer" style={{ height: dockReserve }} />}
 				</ConversationContent>
-				{/* The dock: an overlay sibling of the scroller (the
-				    use-stick-to-bottom pattern). The scroll-down button lives
-				    INSIDE the overlay now (owner refinement round, 2026-09-24):
-				    anchored to the dock block's top edge, so it rides every
-				    height morph (typing, a question growing the band, the
-				    fold) and NEVER overlaps the composer. */}
-				<DockOverlay
-					pending={pending}
-					practice={activeProblem}
-					compactionRunning={compacting}
-					onSubmitThinking={submitThinking}
-					chatId={chatId}
-					plan={hasPlan ? <PlanMarginalia messages={messages} /> : undefined}
-					onOpenPlan={() => setPlanOpen(true)}
-					requiresReveal={requiresReveal}
-					readingThinking={readingThinking}
-					onReadingThinking={applyReadingThinking}
-					phase={phases.at(-1) ?? "probe"}
-					turns={turns}
-					contextTokens={contextTokens}
-					pricing={pricing}
-					onReserve={setDockReserve}
-					dictationSlot={<DictationBar dictation={dictation} />}
-					dictationCancel={dictation.cancel}
-					queuedSteers={visibleQueuedSteers(steerQueue, nativeMessages)}
-					setupCta={
-						zeroKeys ? (
-							<ZeroKeysPill onOpen={() => setSetupOpen(true)} />
-						) : (
-							!configured && (
-								<div className="pointer-events-auto mb-2 flex justify-center">
-									<button
-										type="button"
-										data-testid="setup-cta"
-										onClick={() => setSetupOpen(true)}
-										className="rounded-sm border border-border bg-card px-3 py-1.5 font-ui text-xs text-foreground transition-colors hover:border-muted-foreground/50 hover:bg-accent cursor-pointer"
-									>
-										Set up your models
-									</button>
-								</div>
-							)
-						)
-					}
-					composer={
-						<Composer
-							// Stop aborts ANY in-flight turn (stream-reattach wave): the
-							// square renders while a reattached/wake turn runs too — the
-							// abort channel kills it server-side; stop() alone would
-							// only detach our view.
-							busy={busy}
-							value={text}
-							onChange={applyText}
-							inputRef={composerInputRef}
-							onSend={onSend}
-							onStop={abortInFlightTurn}
-							canSend={canSend}
-							onEscape={dictation.active ? dictation.cancel : undefined}
-							// The pause affordance (owner round 16): the placeholder
-							// IS the hint — empty state, exactly where Enter-on-empty
-							// applies.
-							nextProblem={nextReady}
-							onNext={sendNext}
-							placeholder={nextReady ? "Ask anything, or press Enter for the next one." : undefined}
-						/>
-					}
-					onSubmitAnswer={(output) => {
-						if (!pending) return;
-						// THE ANSWER IS THE QUESTION CALL'S TOOL RESULT (fork 1, owner
-						// 2026-09-26): one input event, one turn — the hook appends
-						// the optimistic graded result (the AnsweredCard shows at
-						// once) and the server's write-ahead persists it before the
-						// turn; the teacher's reaction streams below it. Dismissals
-						// ride the same callback (QuestionAnswerData.dismissed). The
-						// reading-thinking draft rides along (owner 2026-10-03) — the
-						// check answer is its only carrier.
-						const reading = readingThinkingRef.current.trim() || undefined;
-						clearReadingThinking();
-						submitAnswer(pending.tool, pending.toolCallId, reading ? { ...output, readingThinking: reading } : output);
-					}}
-				/>
+				{!mobile && dock}
+				{mobile && <ConversationScrollButton className="bottom-3 left-auto right-3 translate-x-0" />}
 				</Conversation>
 
 				{/* The session-scoped focuses (chrome-melt wave, 2026-09-19): mounted
@@ -1891,7 +1890,8 @@ function DockOverlay({
 	 *  home and /chat/new carry, above the composer while slots are unset. */
 	setupCta?: React.ReactNode;
 }) {
-	const { isAtBottom, scrollToBottom, scrollRef } = useStickToBottomContext();
+	const { isAtBottom, scrollToBottom, scrollRef, stopScroll } = useStickToBottomContext();
+	const mobile = useMobileCompanion();
 	// Render-fresh bottom state (flicker round): the arrival block below reads
 	// it DURING RENDER — the same value the after-paint effect used to read a
 	// frame too late. Assigned per render like the other refs below.
@@ -2048,12 +2048,7 @@ function DockOverlay({
 		return () => ro.disconnect();
 	}, [scrollRef]);
 
-	const mobile = useMobileCompanion();
-    useEffect(() => {
-        const root = blockRef.current;
-        const transcript = scrollRef.current;
-        if (mobile && root && transcript) return bindDockTouchScroll(root, transcript);
-    }, [mobile, scrollRef]);
+
 
     // Wheel over the dock must still scroll the transcript (owner, scroll
 	// round 2): the overlay is a SIBLING of the scroller, so the browser's
@@ -2063,6 +2058,7 @@ function DockOverlay({
 	// own edge chaining; only when nothing under the cursor can take the
 	// delta do we forward it to the transcript.
 	useEffect(() => {
+		if (mobile) return;
 		const root = blockRef.current;
 		const el = scrollRef.current;
 		if (!root || !el) return;
@@ -2080,7 +2076,7 @@ function DockOverlay({
 		};
 		root.addEventListener("wheel", onWheel, { passive: false });
 		return () => root.removeEventListener("wheel", onWheel);
-	}, [scrollRef]);
+	}, [mobile, scrollRef]);
 
 	// ── The reserve: the spacer's height, reported upward ──
 	// Grows immediately (typing, new variants). NEVER drops while a question
@@ -2091,6 +2087,7 @@ function DockOverlay({
 	const reserveRef = useRef(0);
 	const blockRef = useRef<HTMLDivElement>(null);
 	const offer = (blockH: number) => {
+		if (mobile) return;
 		const next = blockH + GRADIENT_H;
 		if (next <= reserveRef.current + 0.5 && pendingRef.current) return; // fold immunity
 		// Reserve GROWTH is the phantom-scroll SOURCE (flicker round,
@@ -2120,6 +2117,7 @@ function DockOverlay({
 	const expandIntentRef = useRef(false);
 	const intentTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 	const suppressFoldDuringReveal = () => {
+		if (mobile) return Promise.resolve();
 		expandIntentRef.current = true;
 		clearTimeout(intentTimerRef.current);
 		intentTimerRef.current = setTimeout(() => {
@@ -2130,6 +2128,17 @@ function DockOverlay({
 			expandIntentRef.current = false;
 		});
 	};
+	// Inline forms start at their heading on mount and reveal, including long pending questions.
+	useEffect(function anchorMobileQuestion() {
+		if (!mobile || !expanded || (!pendingId && !practice?.toolCallId)) return;
+		stopScroll();
+		const frame = requestAnimationFrame(() => {
+			const scroller = scrollRef.current, block = blockRef.current;
+			if (scroller && block) scroller.scrollTop += block.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+		});
+		return () => cancelAnimationFrame(frame);
+	}, [mobile, expanded, pendingId, practice?.toolCallId, scrollRef, stopScroll]);
+
 	const expandAndReveal = () => {
 		setRevealed(true); // the teach-check invitation was accepted (W5)
 		setExpanded(true);
@@ -2228,13 +2237,13 @@ function DockOverlay({
 	const contentRef = useRef<HTMLDivElement>(null);
 	const prevExpandedForFadeRef = useRef(expanded);
 	useIsoLayoutEffect(() => {
-		if (prevExpandedForFadeRef.current === expanded) return;
+		if (mobile || prevExpandedForFadeRef.current === expanded) return;
 		prevExpandedForFadeRef.current = expanded;
 		contentRef.current?.animate(
 			[{ opacity: 0, transform: "translateY(6px)" }, { opacity: 1, transform: "translateY(0)" }],
 			{ duration: 160, easing: "cubic-bezier(0.2, 0.8, 0.2, 1)" },
 		);
-	}, [expanded]);
+	}, [mobile, expanded]);
 	// The height-morph key (components/dock-state-key.ts): the expanded
 	// term (the fold) belongs to EVERY docked variant — question AND
 	// practice (owner fix, 2026-10-06). Typing growth keeps the key and
@@ -2242,6 +2251,7 @@ function DockOverlay({
 	const stateKey = dockStateKey(mode, !!pending || !!practice, expanded);
 	const prevRef = useRef<{ key: string; height: number } | null>(null);
 	useIsoLayoutEffect(() => {
+		if (mobile) return;
 		const el = shellRef.current;
 		if (!el) return;
 		const p = prevRef.current;
@@ -2271,8 +2281,8 @@ function DockOverlay({
 	});
 
 	return (
-		<div className="pointer-events-none absolute inset-x-0 bottom-0" style={{ right: sbInset }}>
-			<div className="h-24 bg-gradient-to-t from-background via-background/85 to-transparent" />
+		<div data-testid="session-dock" className={mobile ? "relative" : "pointer-events-none absolute inset-x-0 bottom-0"} style={mobile ? undefined : { right: sbInset }}>
+			{!mobile && <div className="h-24 bg-gradient-to-t from-background via-background/85 to-transparent" />}
 			<div ref={blockRef} className="relative bg-background pb-5" style={{ "--dock-max-h": dockMaxH ? `${dockMaxH}px` : undefined } as React.CSSProperties}>
 				<div className={DOCK}>
 					{setupCta}
@@ -2303,15 +2313,11 @@ function DockOverlay({
 						/>
 					)}
 					<div ref={shellRef} className="pointer-events-auto overflow-hidden rounded-2xl border bg-card shadow-lg">
-                        {mobile && expanded && (pending || practice) && (
-                            <button type="button" data-testid="mobile-read-lesson" className="min-h-11 w-full border-b border-border px-4 text-left text-sm underline" onClick={() => setExpanded(false)}>
-                                Read lesson
-                            </button>
-                        )}
+
 						<div
 						ref={contentRef}
 						key={mode}
-						className={mode === initialModeRef.current ? undefined : "dock-variant"}
+						className={mobile || mode === initialModeRef.current ? undefined : "dock-variant"}
 					>
 							{pending ? (
 								<QuestionDock
@@ -2366,7 +2372,7 @@ function DockOverlay({
 					    overlay is none by default. The isAtBottom/scrollToBottom
 					    context still reaches it — DockOverlay is a Conversation
 					    child. */}
-					<ConversationScrollButton className="pointer-events-auto bottom-full mb-2" />
+					{!mobile && <ConversationScrollButton className="pointer-events-auto bottom-full mb-2" />}
 				</div>
 				{/* The plan marginalia (owner, plan-placement round): the bare
 				    diagram in the band's right flank — boundaless, meet-fitted, part
