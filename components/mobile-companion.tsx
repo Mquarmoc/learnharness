@@ -17,7 +17,7 @@ export function MobileFrame({ children }: { children: ReactNode }) {
 				if (res.status === 401) { window.location.assign("/pair"); return; }
 				if (!res.ok) throw new Error();
 				const body = await res.json();
-				setStatus(body.preview ? "Test preview · sample lessons · no AI connected" : "Phone paired. Keep the PC awake; LearnHarness can run in the background.");
+				setStatus(body.preview ? "Test preview · sample lessons · no AI connected" : "Connected to PC. Keep it awake.");
 			} catch { setStatus("Desktop unavailable. Start LearnHarness on the PC, then reload."); }
 		};
 		void check();

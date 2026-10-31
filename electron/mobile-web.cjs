@@ -25,6 +25,13 @@ const bootstrap = `
       });
       const form = document.querySelector('form[action="/pair"]');
       if (form) {
+        const saved = localStorage.getItem(key);
+        if (saved) {
+          await setToken(saved);
+          const response = await fetch("/mobile/status", { headers: { Authorization: "Bearer " + saved }, cache: "no-store", signal: AbortSignal.timeout(8000) });
+          if (response.ok) { await control(); location.replace("/mobile"); return; }
+          if (response.status !== 401) throw new Error("Could not check this phone connection. Reload and try again.");
+        }
         localStorage.removeItem(key);
         localStorage.removeItem("lh-phone-bootstrap");
         await setToken("");

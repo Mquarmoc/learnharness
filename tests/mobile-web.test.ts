@@ -73,7 +73,7 @@ async function browserFixture(success = true, options: { mode?: "pair" | "gate" 
         setTimeout: (callback: () => void) => { timers.set(++nextTimer, callback); return nextTimer; },
         clearTimeout: (id: number) => timers.delete(id),
         FormData: class { *[Symbol.iterator]() { yield ["code", "sample-code"]; } },
-        fetch: async () => ({ ok: success, json: async () => success ? { token: "scoped-token" } : { error: "This code has expired. Get a new code on the PC." } }),
+        fetch: async () => ({ ok: success, status: success ? 200 : 401, json: async () => success ? { token: "scoped-token" } : { error: "This code has expired. Get a new code on the PC." } }),
     });
     for (let i = 0; i < 10; i++) await new Promise(setImmediate);
     return { button, error, storage, messages, timers, navigation: () => navigation, reloads: () => reloads,
@@ -145,4 +145,18 @@ test("embedded styles and scripts can carry the phone bearer despite their origi
         assert.equal(f.fetched.at(-1)!.headers.get("authorization"), "Bearer safe-token");
         assert.equal(f.fetched.at(-1)!.credentials, "omit");
     }
+});
+test("reopening the pair link reuses a valid stored phone session", async () => {
+    const storage = new Map([["lh-phone-session", "still-valid-token"]]);
+    const browser = await browserFixture(true, { storage });
+    assert.equal(browser.navigation(), "/mobile");
+    assert.equal(storage.get("lh-phone-session"), "still-valid-token");
+    assert.equal(browser.messages.at(-1).token, "still-valid-token");
+});
+test("an expired stored phone session falls back to the pairing form", async () => {
+    const storage = new Map([["lh-phone-session", "expired-token"]]);
+    const browser = await browserFixture(false, { storage });
+    assert.equal(browser.navigation(), "");
+    assert.equal(storage.has("lh-phone-session"), false);
+    assert.equal(browser.button.disabled, false);
 });

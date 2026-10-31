@@ -613,8 +613,8 @@ body[data-mobile="true"] > div { height: var(--lh-mobile-height, 100dvh); }
 .lh-mobile :is(input, textarea, select) { font-size: 16px; }
 .lh-mobile :is(button, a, input, textarea, select):focus-visible { outline: 2px solid #a8c9ff; outline-offset: 2px; }
 @media (max-width: 640px) {
-	.lh-mobile .lh-wco-gutter { gap: 8px; min-height: 60px; height: auto; padding-top: 8px; padding-bottom: 8px; flex-wrap: wrap; }
-	.lh-mobile .lh-wco-gutter > button.font-title { font-size: 20px; max-width: 100%; }
+	.lh-mobile .lh-wco-gutter { gap: 8px; min-height: 60px; height: auto; padding-top: 8px; padding-bottom: 8px; flex-wrap: nowrap; }
+	.lh-mobile .lh-wco-gutter > button.font-title { font-size: 16px; flex: 1 1 0%; min-width: 0; max-width: none; }
 	.lh-mobile [data-testid="composer"] textarea { min-width: 0; }
 	.lh-mobile :is(pre, table) { max-width: 100%; overflow-x: auto; }
 	.lh-mobile .font-prose { overflow-wrap: anywhere; }
@@ -624,3 +624,9 @@ body[data-mobile="true"] > div { height: var(--lh-mobile-height, 100dvh); }
 
 .lh-mobile .text-xs { font-size: 12px; }
 .lh-mobile [data-testid="confidence-track"], .lh-mobile [data-testid="confidence-slider"] { height: 44px; }
+
+@media (max-width: 640px) {
+    .lh-mobile-nav { column-gap: 8px; font-size: 12px; }
+    .lh-mobile-nav > form { margin-left: auto; }
+    .lh-mobile-nav > p { margin: 0; padding-bottom: 6px; }
+}

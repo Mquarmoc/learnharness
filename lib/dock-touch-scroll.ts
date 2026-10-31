@@ -3,11 +3,13 @@ export function bindDockTouchScroll(root: HTMLElement, transcript: HTMLElement) 
     let point: { x: number; y: number } | null = null;
     const reset = () => { point = null; };
     const start = (event: TouchEvent) => {
-        point = event.touches.length === 1 ? { x: event.touches[0].clientX, y: event.touches[0].clientY } : null;
+        const touch = event.touches.length === 1 ? event.touches[0] : undefined;
+        point = touch ? { x: touch.clientX, y: touch.clientY } : null;
     };
     const move = (event: TouchEvent) => {
         if (!point || event.touches.length !== 1) { reset(); return; }
         const touch = event.touches[0];
+        if (!touch) { reset(); return; }
         const deltaY = point.y - touch.clientY;
         const deltaX = point.x - touch.clientX;
         point = { x: touch.clientX, y: touch.clientY };
