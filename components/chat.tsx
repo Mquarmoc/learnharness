@@ -2173,7 +2173,7 @@ function DockOverlay({
 		const el = scrollRef.current;
 		if (!el) return;
 		const onScroll = () => {
-			if (!pendingRef.current) return;
+			if (mobile || !pendingRef.current) return;
 			// Resize mute (owner, resize round): a geometry change re-clamps
 			// scrollTop and the browser emits the clamp as a scroll event —
 			// reading the transient position folded the box to the bar for a
@@ -2199,7 +2199,7 @@ function DockOverlay({
 		};
 		el.addEventListener("scroll", onScroll, { passive: true });
 		return () => el.removeEventListener("scroll", onScroll);
-	}, [scrollRef, scrollToBottom]);
+	}, [mobile, scrollRef, scrollToBottom]);
 
 	// The settled block height (gradient excluded), offered to the spacer.
 	// Only ever called with NATURAL heights — never the animated mid-morph
@@ -2303,6 +2303,11 @@ function DockOverlay({
 						/>
 					)}
 					<div ref={shellRef} className="pointer-events-auto overflow-hidden rounded-2xl border bg-card shadow-lg">
+                        {mobile && expanded && (pending || practice) && (
+                            <button type="button" data-testid="mobile-read-lesson" className="min-h-11 w-full border-b border-border px-4 text-left text-sm underline" onClick={() => setExpanded(false)}>
+                                Read lesson
+                            </button>
+                        )}
 						<div
 						ref={contentRef}
 						key={mode}

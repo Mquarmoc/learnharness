@@ -630,3 +630,13 @@ body[data-mobile="true"] > div { height: var(--lh-mobile-height, 100dvh); }
     .lh-mobile-nav > form { margin-left: auto; }
     .lh-mobile-nav > p { margin: 0; padding-bottom: 6px; }
 }
+/* On phones the complete question form scrolls together, without a pinned footer. */
+.lh-mobile [data-testid="question-dock"] {
+    max-height: calc(var(--dock-max-h, 55dvh) - 108px);
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+}
+.lh-mobile [data-testid="question-dock"] > [data-session-find-root] {
+    max-height: none;
+    overflow: visible;
+}
