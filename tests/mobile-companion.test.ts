@@ -193,3 +193,12 @@ test("external links may open the public pairing document without authorizing cr
         assert.equal((await f.request("/pair", "POST", "", "code=" + code)).status, 200);
     } finally { await f.close(); }
 });
+test("Next router segment-prefetch metadata survives the authenticated proxy", async () => {
+    const f = await fixture();
+    try {
+        const { cookie } = await f.pair();
+        await f.request("/chat/sample?_rsc=sample", "GET", cookie, "", { rsc: "1", "next-router-prefetch": "1", "next-router-segment-prefetch": "/_full", "next-url": "/mobile" });
+        assert.equal(f.seen.at(-1)!.headers["next-router-segment-prefetch"], "/_full");
+        assert.equal(f.seen.at(-1)!.headers["next-url"], "/mobile");
+    } finally { await f.close(); }
+});

@@ -149,7 +149,7 @@ async function createMobileCompanion({ target, secret, publicOrigin, now = Date.
 		if (!learningRoute(req.method, pathname)) return json(res, 403, { error: "This action is available on the desktop only." });
 		// Build headers from an allowlist: never forward cookies, credentials or a client capability.
 		const headers = { host: upstream.host, "x-learnharness-desktop": secret, cookie: "lh-mobile=1" };
-		for (const name of ["accept", "content-type", "content-length", "last-event-id", "rsc", "next-router-state-tree", "next-router-prefetch", "next-url"]) {
+		for (const name of ["accept", "content-type", "content-length", "last-event-id", "rsc", "next-router-state-tree", "next-router-prefetch", "next-router-segment-prefetch", "next-url"]) {
 			if (req.headers[name]) headers[name] = req.headers[name];
 		}
 		const relay = http.request(new URL(req.url, upstream), { method: req.method, headers }, (response) => {
