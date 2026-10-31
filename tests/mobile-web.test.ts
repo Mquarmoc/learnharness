@@ -132,3 +132,17 @@ test("worker installation deadline produces recovery text instead of an endless 
     for (let i = 0; i < 5; i++) await new Promise(setImmediate);
     assert.match(browser.error.textContent, /Reload this page/);
 });
+
+test("embedded styles and scripts can carry the phone bearer despite their original no-cors mode", async () => {
+    const f = fixture();
+    f.listeners.get("message")!({ origin, source: { url: origin + "/mobile" }, data: { type: "lh-session", token: "safe-token" }, ports: [] });
+    for (const path of ["/_next/static/chunks/app.css", "/_next/static/chunks/app.js"]) {
+        let response!: Promise<Response>;
+        f.listeners.get("fetch")!({ request: new Request(origin + path, { mode: "no-cors" }), respondWith: (value: Promise<Response>) => response = value });
+        await response;
+        // Browsers strip Authorization when cloning a request that retains no-cors.
+        assert.equal(f.fetched.at(-1)!.mode, "same-origin");
+        assert.equal(f.fetched.at(-1)!.headers.get("authorization"), "Bearer safe-token");
+        assert.equal(f.fetched.at(-1)!.credentials, "omit");
+    }
+});

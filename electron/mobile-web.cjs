@@ -95,7 +95,8 @@ self.addEventListener("fetch", (event) => {
     const auth = await sessionFor(event);
     const headers = new Headers(event.request.headers);
     if (auth) headers.set("Authorization", "Bearer " + auth); else headers.delete("Authorization");
-    return fetch(new Request(event.request, { headers, cache: "no-store", credentials: "omit" }));
+    // Embedded no-cors requests otherwise lose the Authorization header in browsers.
+    return fetch(new Request(event.request, { headers, mode: "same-origin", cache: "no-store", credentials: "omit" }));
   })());
 });
 `;
