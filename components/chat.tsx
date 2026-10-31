@@ -1,6 +1,8 @@
 "use client";
 
 import { createContext, Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { bindDockTouchScroll } from "@/lib/dock-touch-scroll";
+import { useMobileCompanion } from "@/components/mobile-companion";
 import { useChatSession } from "@/components/session";
 import { visibleQueuedSteers } from "@/components/session-core";
 import { SetupDialog } from "@/components/setup-dialog";
@@ -2046,7 +2048,14 @@ function DockOverlay({
 		return () => ro.disconnect();
 	}, [scrollRef]);
 
-	// Wheel over the dock must still scroll the transcript (owner, scroll
+	const mobile = useMobileCompanion();
+    useEffect(() => {
+        const root = blockRef.current;
+        const transcript = scrollRef.current;
+        if (mobile && root && transcript) return bindDockTouchScroll(root, transcript);
+    }, [mobile, scrollRef]);
+
+    // Wheel over the dock must still scroll the transcript (owner, scroll
 	// round 2): the overlay is a SIBLING of the scroller, so the browser's
 	// native scroll chaining stops at the overlay (the old in-flow dock
 	// chained for free). Internal scrollers — the question area, textarea

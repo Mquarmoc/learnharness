@@ -600,7 +600,8 @@ body {
 }
 
 /* Companion chrome and touch sizing do not change the desktop window. */
-body[data-mobile="true"] { overscroll-behavior: none; }
+html:has(body[data-mobile="true"]), body[data-mobile="true"] { height: 100%; overflow: hidden; overscroll-behavior: none; }
+.lh-mobile [role="log"] { min-height: 0; overscroll-behavior-y: contain; }
 body[data-mobile="true"] > div { height: var(--lh-mobile-height, 100dvh); }
 .lh-mobile { height: var(--lh-mobile-height, 100dvh); overflow: hidden; padding-bottom: env(safe-area-inset-bottom); }
 .lh-mobile-nav { padding-top: env(safe-area-inset-top); }
