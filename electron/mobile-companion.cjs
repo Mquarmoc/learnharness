@@ -160,7 +160,10 @@ async function createMobileCompanion({ target, secret, publicOrigin, now = Date.
 			response.pipe(res);
 			response.on("error", () => res.destroy());
 		});
-		relay.on("error", () => { if (!res.headersSent) json(res, 502, { error: "The desktop is unavailable. Start LearnHarness on the PC, then reload." }); else res.destroy(); });
+		relay.on("error", (error) => {
+			console.warn("[mobile] relay failed", JSON.stringify({ method: req.method, path: pathname, code: error.code ?? "unknown", reusedSocket: relay.reusedSocket === true }));
+			if (!res.headersSent) json(res, 502, { error: "The desktop is unavailable. Start LearnHarness on the PC, then reload." }); else res.destroy();
+		});
 		res.on("close", () => relay.destroy());
 		req.pipe(relay);
 	});
