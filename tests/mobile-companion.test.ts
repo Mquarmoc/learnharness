@@ -175,3 +175,21 @@ test("phone login survives host restart with only a hash persisted, and desktop 
         fs.rmSync(dir, { recursive: true });
     }
 });
+
+test("external links may open the public pairing document without authorizing cross-site requests", async () => {
+    const f = await fixture();
+    const navigation = { "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" };
+    try {
+        const page = await f.request("/pair", "GET", "", "", navigation);
+        assert.equal(page.status, 200);
+        assert.match(page.body, /Pair LearnHarness/);
+        assert.equal(f.seen.length, 0);
+        const { code } = f.companion.issuePairing();
+        assert.equal((await f.request("/pair", "POST", "", "code=" + code, navigation)).status, 403);
+        assert.equal((await f.request("/pair", "GET", "", "", { ...navigation, "sec-fetch-dest": "iframe" })).status, 403);
+        assert.equal((await f.request("/pair", "GET", "", "", { ...navigation, "sec-fetch-mode": "cors" })).status, 403);
+        assert.equal((await f.request("/mobile-bootstrap.js", "GET", "", "", navigation)).status, 403);
+        assert.equal((await f.request("/api/chats", "GET", "", "", navigation)).status, 403);
+        assert.equal((await f.request("/pair", "POST", "", "code=" + code)).status, 200);
+    } finally { await f.close(); }
+});

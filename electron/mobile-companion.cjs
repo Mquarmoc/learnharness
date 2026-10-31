@@ -82,7 +82,10 @@ async function createMobileCompanion({ target, secret, publicOrigin, now = Date.
 		if (!req.url?.startsWith("/") || /[%\\]|\/\//.test(req.url.split("?")[0])) return json(res, 400, { error: "Invalid path." });
 		const url = new URL(req.url, publicOrigin);
 		const pathname = url.pathname;
-		if (req.headers["sec-fetch-site"] === "cross-site"
+		// External app links may navigate to the public pairing page, never submit or read APIs.
+        const pairingNavigation = req.method === "GET" && pathname === "/pair"
+            && req.headers["sec-fetch-mode"] === "navigate" && req.headers["sec-fetch-dest"] === "document";
+        if ((req.headers["sec-fetch-site"] === "cross-site" && !pairingNavigation)
 			|| (req.method !== "GET" && req.method !== "HEAD" && req.headers.origin !== publicOrigin)) {
 			return json(res, 403, { error: "Open this page directly before submitting." });
 		}
