@@ -39,6 +39,11 @@ export const TURN_POLL_MS = 500;
 /** Give up waiting (a wake turn can run long) and surface the 409. */
 export const TURN_WAIT_MAX_MS = 30_000;
 
+function isConnectionFailure(error: unknown): boolean {
+	return error instanceof TypeError || (error instanceof Error &&
+		(error.name === "NetworkError" || /^(network error|failed to fetch)$/i.test(error.message)));
+}
+
 export interface SessionModelDeps {
 	/** Injectable fetch (tests); defaults to the global. */
 	fetch?: typeof globalThis.fetch;
@@ -84,7 +89,7 @@ async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): Asyn
 	let buf = "";
 	for (;;) {
 		const { done, value } = await reader.read();
-		if (done) return;
+		if (done) throw new TypeError("The turn stream disconnected before completion.");
 		buf += decoder.decode(value, { stream: true });
 		for (;;) {
 			const end = buf.indexOf("\n\n");
@@ -229,6 +234,7 @@ export class SessionModel {
 	private statusValue: SessionStatus = "ready";
 	/** Request/loop failures are transient; provider failures derive from messages. */
 	private errorValue: { message: string } | null = null;
+	private connectionError = false;
 	/** A completed failure from THIS consume, not the previous attempt's record. */
 	private liveFailureId: string | null = null;
 	// The single live consume (POST response or reattach stream): a newer
@@ -294,11 +300,12 @@ export class SessionModel {
 	private setStatus(status: SessionStatus): void {
 		if (status === "submitted") this.liveFailureId = null;
 		this.statusValue = status;
-		this.readyRef = status === "ready";
+		this.readyRef = status === "ready" || status === "error";
 		this.onChange?.();
 	}
 
-	private setError(message: string | null): void {
+	private setError(message: string | null, connectionError = false): void {
+		this.connectionError = message !== null && connectionError;
 		this.errorValue = message === null ? null : { message };
 		this.onChange?.();
 	}
@@ -493,6 +500,29 @@ export class SessionModel {
 		this.consumeAbort?.abort();
 		const controller = new AbortController();
 		this.consumeAbort = controller;
+		this.setError(null);
+		for (let attempt = 0; ; attempt++) {
+			try {
+				await this.attachStream(refetchRecordFirst, controller);
+				return;
+			} catch (err) {
+				if (this.consumeAbort !== controller || controller.signal.aborted) return;
+				// Replay only GETs: the accepted learner input must never be resent.
+				if (isConnectionFailure(err) && attempt < 3) {
+					this.setStatus("submitted");
+					await delay(this.pollMs * 2 ** attempt, controller.signal).catch(() => {});
+					if (this.consumeAbort !== controller || controller.signal.aborted) return;
+					refetchRecordFirst = true;
+					continue;
+				}
+				this.setError((err as Error).message, isConnectionFailure(err));
+				this.setStatus("error");
+				return;
+			}
+		}
+	}
+
+	private async attachStream(refetchRecordFirst: boolean, controller: AbortController): Promise<void> {
 		// REPLAY ONTO A CLEAN SLATE (owner, optimistic round 3, 2026-10-02):
 		// the reattach stream replays the turn from its FIRST event — an
 		// aborted earlier attempt (React StrictMode's simulated remount)
@@ -517,43 +547,49 @@ export class SessionModel {
 			});
 		}
 		this.setStatus("submitted");
-		try {
-			if (refetchRecordFirst) {
-				const recordRes = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}`, {
-					signal: controller.signal,
-				});
-				if (this.consumeAbort !== controller) return;
-				if (recordRes.ok) {
-					const record = (await recordRes.json()) as { messages?: LhMessage[] };
-					if (this.consumeAbort !== controller) return;
-					if (Array.isArray(record.messages)) {
-						this.mutate(() => {
-							this.base = record.messages!;
-							this.incompleteUsageIds.clear();
-							this.tail = [];
-						});
-					}
-				} else {
-					// The record did not land — restore the clean-slate guard
-					// before the replay (no atomic swap is coming).
-					this.mutate(() => {
-						this.incompleteUsageIds.clear();
-						this.tail = [];
-						this.streamingMessageId = null;
-					});
-				}
-			}
-			const res = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, {
+
+		if (refetchRecordFirst) {
+			const recordRes = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}`, {
 				signal: controller.signal,
 			});
 			if (this.consumeAbort !== controller) return;
-			if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
-			await this.consumeStream(res, controller);
-		} catch (err) {
-			if (this.consumeAbort !== controller || (err as Error).name === "AbortError") return; // a newer consume won
-			this.setError((err as Error).message);
-			this.setStatus("error");
+			if (recordRes.status === 401 || recordRes.status === 403) {
+				throw new Error((await recordRes.text()) || "Phone access refused.");
+			}
+			if (recordRes.ok) {
+				const record = (await recordRes.json()) as { messages?: LhMessage[]; turnInFlight?: boolean };
+				if (this.consumeAbort !== controller) return;
+				if (Array.isArray(record.messages)) {
+					this.mutate(() => {
+						this.base = record.messages!;
+						this.incompleteUsageIds.clear();
+						this.tail = [];
+					});
+					// A settled snapshot already contains the next question; no stream remains to replay.
+					if (record.turnInFlight === false) {
+						this.streamingMessageId = null;
+						this.setStatus("ready");
+						this.onReattachSettled?.();
+						return;
+					}
+				}
+			} else {
+				// The record did not land — restore the clean-slate guard
+				// before the replay (no atomic swap is coming).
+				this.mutate(() => {
+					this.incompleteUsageIds.clear();
+					this.tail = [];
+					this.streamingMessageId = null;
+				});
+			}
 		}
+		const res = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, {
+			signal: controller.signal,
+		});
+		if (this.consumeAbort !== controller) return;
+		if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
+		await this.consumeStream(res, controller);
+
 	}
 
 	/**
@@ -743,6 +779,12 @@ export class SessionModel {
 	/** Full snapshot swap (the idle settle sync — server canon). */
 	setMessages(record: LhMessage[]): void {
 		this.mutate(() => {
+			if (this.connectionError) {
+				this.errorValue = null;
+				this.connectionError = false;
+				this.statusValue = "ready";
+				this.readyRef = true;
+			}
 			this.base = record;
 			this.incompleteUsageIds.clear();
 			this.tail = [];

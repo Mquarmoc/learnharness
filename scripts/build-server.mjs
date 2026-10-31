@@ -88,4 +88,15 @@ for (const asset of [
 	}
 }
 
+// Turbopack relocates Streamdown's Shiki but omits its nested versioned packages.
+const shikiSource = path.join(ROOT, "node_modules/@streamdown/code/node_modules");
+const shikiVersion = JSON.parse(fs.readFileSync(path.join(shikiSource, "shiki/package.json"), "utf8")).version;
+const aliases = path.join(STANDALONE, ".next/node_modules");
+for (const name of fs.readdirSync(aliases).filter((name) => name.startsWith("shiki-"))) {
+    const packaged = path.join(aliases, name);
+    if (JSON.parse(fs.readFileSync(path.join(packaged, "package.json"), "utf8")).version !== shikiVersion) {
+        throw new Error("Packaged Shiki version differs from the installed Streamdown dependency.");
+    }
+    copyTree(path.join(shikiSource, "@shikijs"), path.join(packaged, "node_modules/@shikijs"));
+}
 console.log("[build-server] server payload ready:", STANDALONE);

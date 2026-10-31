@@ -30,6 +30,8 @@ export interface SubagentRunOptions {
 	prompt?: string;
 	/** Max model calls (the old stepCountIs safety net). */
 	maxTurns: number;
+	/** Reserve the last request for a text deliverable without more tools. */
+	finalTurnPrompt?: string;
 	/** Abort mid-model-call (the real-kill semantics). */
 	abortSignal?: AbortSignal;
 	/** Money channel: one call per model request. */
@@ -77,6 +79,14 @@ export async function runSubagent(tools: AgentTool<any, any>[], opts: SubagentRu
 			messages: opts.messages ?? [],
 		},
 		streamFn: engine.streamFn,
+		prepareRequest: (request) => {
+			if (!opts.finalTurnPrompt || turns < opts.maxTurns - 1) return;
+			return { context: { ...request.context, tools: [], messages: [
+				...request.context.messages,
+				{ role: "system", content: opts.finalTurnPrompt,
+					toolsRemoved: tools.map(({ name }) => ({ name })), timestamp: Date.now() },
+			] } };
+		},
 		...(providerEvents ? { onProviderStreamEvent: providerEvents } : {}),
 		// 0.87.1: shouldStopAfterTurn → finishTurn (same call point; "end"
 		// exits before the steering poll, exactly the old boolean-true).

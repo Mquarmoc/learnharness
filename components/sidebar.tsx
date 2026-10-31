@@ -1,5 +1,6 @@
 "use client";
 
+import { MobileFrame } from "@/components/mobile-companion";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
@@ -932,7 +933,8 @@ function SessionsSidebar() {
 }
 
 /** The app frame: sidebar inline + content. Rendered once in the root layout. */
-export function AppShell({ children }: { children: React.ReactNode }) {
+export function AppShell({ children, mobile = false }: { children: React.ReactNode; mobile?: boolean }) {
+	if (mobile) return <SettingsDialogProvider disabled><MobileFrame>{children}</MobileFrame></SettingsDialogProvider>;
 	return (
 		<SettingsDialogProvider>
 			<SessionsSidebar />

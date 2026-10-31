@@ -29,6 +29,7 @@ const { createChatGPT, fileStore } = require("./chatgpt.cjs");
 const { attachChatGPTChild, trustedSender, chatGPTControl } = require("./chatgpt-ipc.cjs");
 const { createSubscriptions, loadSubscriptionSDK } = require("./subscriptions.cjs");
 const { attachSubscriptionChild, subscriptionControl } = require("./subscription-ipc.cjs");
+const { createMobileCompanion } = require("./mobile-companion.cjs");
 const { desktopAPIHeaders } = require("./desktop-api.cjs");
 const { randomBytes } = require("node:crypto");
 const { spawn } = require("node:child_process");
@@ -42,6 +43,7 @@ const path = require("node:path");
 const SIDEBAR_AUTOCLOSE = 928;
 
 const PRODUCT_NAME = "LearnHarness";
+let openDesktopOnReady = !process.argv.includes("--mobile-background");
 
 // APP NAME → userData (owner, 2026-10-10): the Application Support dir is
 // exactly "LearnHarness" in dev AND packaged. Packaged Electron would
@@ -50,6 +52,7 @@ const PRODUCT_NAME = "LearnHarness";
 // Must run before the LH_DEV_URL suffix below — dev becomes
 // "LearnHarness-dev".
 app.setName(PRODUCT_NAME);
+if (process.env.LH_USER_DATA_DIR) app.setPath("userData", path.resolve(process.env.LH_USER_DATA_DIR));
 const AUTH_FILE = () => path.join(app.getPath("userData"), "auth.json");
 const DATA_DIR = () => path.join(app.getPath("userData"), "data");
 
@@ -122,14 +125,11 @@ if (process.argv.includes("--browser-service")) {
 	if (!app.requestSingleInstanceLock()) {
 		app.quit();
 	} else {
-		app.on("second-instance", () => {
-			const win = BrowserWindow.getAllWindows()[0];
-			if (win) {
-				if (win.isMinimized()) win.restore();
-				win.focus();
-			}
-		});
-		main();
+		app.on("second-instance", showDesktop);
+        main().catch((error) => {
+            log("desktop startup failed: " + error.message);
+            app.exit(1);
+        });
 	}
 }
 
@@ -140,6 +140,31 @@ let subscriptions = null;
 let subscriptionChild = null;
 // Per-launch request capability, never OAuth tokens and never renderer state.
 let desktopAPISecret = null;
+let mobileCompanion = null;
+let mobileControlWatcher = null;
+let ownedServerURL = null;
+function showDesktop() {
+    openDesktopOnReady = true;
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) {
+        if (win.isMinimized()) win.restore();
+        win.show();
+        win.focus();
+    }
+}
+function mobilePairing() {
+    const pairing = mobileCompanion.issuePairing();
+    if (process.env.LH_MOBILE_PAIRING_FILE) fs.writeFileSync(process.env.LH_MOBILE_PAIRING_FILE, JSON.stringify(pairing), { mode: 0o600 });
+    if (process.env.LH_MOBILE_PAIRING_FILE) void chatgpt?.status().then((status) => {
+        fs.writeFileSync(path.join(path.dirname(process.env.LH_MOBILE_PAIRING_FILE), "connection-status.json"), JSON.stringify({
+            available: status.available, error: status.error, catalogError: status.catalogError,
+            accountCount: status.accounts.length,
+            connectedAccounts: status.accounts.filter((account) => account.connected).length,
+            needsSignIn: status.accounts.some((account) => account.canSignInAgain),
+        }));
+    }).catch(() => {});
+    return pairing;
+}
 const trustedAppWindows = new Set();
 
 // A GUI shell must never die to a stray exception (EPIPE dialogs, a race
@@ -222,6 +247,7 @@ function startServer(port) {
 					LH_DESKTOP_API_SECRET: desktopAPISecret,
 				},
 				stdio: ["ignore", "pipe", "pipe", "ipc"],
+				windowsHide: true,
 			},
 		);
 		serverProcess = child;
@@ -231,6 +257,7 @@ function startServer(port) {
 		child.stdout.on("data", fwd);
 		child.stderr.on("data", fwd);
 		child.on("exit", (code, signal) => {
+            const unexpected = serverProcess === child;
 			log(`server exited (code=${code} signal=${signal})`);
 			serverProcess = null;
 			chatgptChild?.dispose();
@@ -239,29 +266,36 @@ function startServer(port) {
 			subscriptionChild = null;
 			chatgpt?.close();
 			subscriptions?.close();
+            if (unexpected && process.env.LH_MOBILE_AUTO_START === "1") app.exit(1);
 		});
 		resolve(child);
 	});
 }
 
 /** No "ready" event exists — poll until the server answers (docs-confirmed). */
-function waitUntilUp(url, tries = 150) {
-	return new Promise((resolve, reject) => {
-		const attempt = (n) => {
-			const req = http.get(url, (res) => {
-				res.resume();
-				resolve(res.statusCode !== undefined);
-			});
-			req.on("error", () => {
-				if (n <= 0) reject(new Error(`server never answered on ${url}`));
-				else setTimeout(() => attempt(n - 1), 200);
-			});
-		};
-		attempt(tries);
-	});
+function waitUntilUp(url, timeoutMs = 180_000) {
+    const deadline = Date.now() + timeoutMs;
+    return new Promise((resolve, reject) => {
+        const attempt = () => {
+            const req = http.get(url + "/favicon.ico", (res) => {
+                res.resume();
+                resolve(res.statusCode !== undefined);
+            });
+            req.setTimeout(Math.max(1, Math.min(2000, deadline - Date.now())),
+                () => req.destroy(new Error("Startup probe timed out")));
+            req.on("error", () => {
+                if (Date.now() >= deadline) reject(new Error(`server never answered on ${url}`));
+                else setTimeout(attempt, 200);
+            });
+        };
+        attempt();
+    });
 }
 
 function killServer() {
+	mobileControlWatcher?.close();
+	mobileCompanion?.close().catch(() => {});
+	mobileCompanion = null;
 	chatgpt?.close();
 	subscriptions?.close();
 	if (!serverProcess) return;
@@ -284,7 +318,7 @@ function killServer() {
  *    default, we do not);
  *  - will-navigate pinned to the app origin; window.open always denied —
  *    external links go to the real browser via shell.openExternal. */
-function createWindow(url) {
+function createWindow(url, background = false) {
 	const win = new BrowserWindow({
 		width: 1440,
 		height: 900,
@@ -386,7 +420,14 @@ function createWindow(url) {
 		event.preventDefault();
 	});
 
-	win.once("ready-to-show", () => win.show());
+    // Closing the desktop window must not pause the phone's model connection.
+    win.on("close", (event) => {
+        if (mobileCompanion) {
+            event.preventDefault();
+            win.hide();
+        }
+    });
+	win.once("ready-to-show", () => { if (!background) win.show(); });
 	return win;
 }
 
@@ -475,7 +516,7 @@ function installUpdateNow() {
 }
 
 function setupAutoUpdater() {
-	if (!app.isPackaged) {
+	if (!app.isPackaged || process.env.LH_DISABLE_AUTO_UPDATE === "1") {
 		log("auto-update: dev build — updater disabled");
 		return;
 	}
@@ -524,6 +565,30 @@ function applyZoom(win, factor) {
 
 /** macOS needs an application menu with the Edit roles — without one,
  *  Cmd+C/V/A do nothing in the renderer. Everything else stays minimal. */
+async function mobileMenu() {
+    if (mobileCompanion) {
+        const choice = await dialog.showMessageBox({ message: "Mobile companion is enabled", detail: "A new code replaces the previous unused code. Disconnect all phones also ends active streams.", buttons: ["New pairing code", "Disconnect all phones", "Disable companion", "Cancel"], cancelId: 3 });
+        if (choice.response === 3) return;
+        if (choice.response === 1) { mobileCompanion.revoke(); return; }
+        if (choice.response === 2) { mobileCompanion.revoke(); await mobileCompanion.close(); mobileCompanion = null; return; }
+    } else {
+        if (!desktopAPISecret || !process.env.LH_MOBILE_ORIGIN) {
+            await dialog.showMessageBox({ message: "Private mobile access needs setup", detail: "Run the packaged desktop host with LH_MOBILE_ORIGIN set to your private HTTPS origin, and route Tailscale Serve to LH_MOBILE_PORT (default 8792). See docs/mobile-companion.md. Development servers cannot reuse desktop ChatGPT sign-in." });
+            return;
+        }
+        try {
+            const companion = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN, stateFile: process.env.LH_MOBILE_STATE_FILE });
+            await companion.listen(Number(process.env.LH_MOBILE_PORT || 8792));
+            mobileCompanion = companion;
+        } catch (error) {
+            await dialog.showMessageBox({ type: "error", message: "Could not enable mobile companion", detail: String(error.message) });
+            return;
+        }
+    }
+    const pairing = mobilePairing();
+    await dialog.showMessageBox({ message: "Connect your phone", detail: "Open " + process.env.LH_MOBILE_ORIGIN + "/pair on your phone.\n\nCode: " + pairing.code + "\n\nWorks once; expires in 10 minutes. Keep this PC awake. Phone access continues when the desktop window is closed. Only share this code with your own phone." });
+}
+
 function installMenu() {
 	const template = [
 		{
@@ -533,11 +598,12 @@ function installMenu() {
 				// Manual check (Wave C): answers via native dialog — no renderer
 				// round-trip. The 24h automatic checks stay silent.
 				{ label: "Check for Updates…", click: () => checkForUpdates({ manual: true }) },
+				{ label: "Mobile companion…", click: () => mobileMenu().catch((error) => log("mobile companion: " + error.message)) },
 				{ type: "separator" },
 				{ role: "hide" },
 				{ role: "hideOthers" },
 				{ type: "separator" },
-				{ role: "quit" },
+				{ role: "quit", label: process.env.LH_MOBILE_AUTO_START === "1" ? "Quit and stop phone access" : "Quit" },
 			],
 		},
 		{ label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
@@ -595,6 +661,7 @@ async function main() {
 	// (guards, menu, single instance).
 	const devUrl = process.env.LH_DEV_URL;
 	const url = devUrl ?? `http://127.0.0.1:${await freePort()}`;
+	ownedServerURL = url;
 	if (!devUrl) {
 		desktopAPISecret = randomBytes(32).toString("hex");
 		const ownedOrigin = new URL(url).origin;
@@ -646,6 +713,32 @@ async function main() {
 		return subscriptionControl(command, subscriptions);
 	});
 
+    if (process.env.LH_MOBILE_AUTO_START === "1") {
+        let candidate;
+        try {
+            candidate = await createMobileCompanion({ target: ownedServerURL, secret: desktopAPISecret, publicOrigin: process.env.LH_MOBILE_ORIGIN, stateFile: process.env.LH_MOBILE_STATE_FILE });
+            await candidate.listen(Number(process.env.LH_MOBILE_PORT || 8792));
+            mobileCompanion = candidate;
+            mobilePairing();
+            if (process.env.LH_MOBILE_CONTROL_FILE) {
+                const control = process.env.LH_MOBILE_CONTROL_FILE;
+                if (fs.existsSync(control) && fs.readFileSync(control, "utf8") === "show") showDesktop();
+                fs.writeFileSync(control, "");
+                mobileControlWatcher = fs.watch(control, () => {
+                    if (!mobileCompanion) return;
+                    if (fs.readFileSync(control, "utf8") === "show") {
+                        fs.writeFileSync(control, "");
+                        showDesktop();
+                    } else mobilePairing();
+                });
+            }
+        } catch (error) {
+            await candidate?.close().catch(() => {});
+            mobileCompanion = null;
+            log("mobile startup failed: " + error.message);
+        }
+    }
+
 	installMenu();
 
 	// Auto-update (Wave C): wire the updater before the window so the
@@ -672,8 +765,9 @@ async function main() {
 	});
 	app.on("activate", () => {
 		if (BrowserWindow.getAllWindows().length === 0) { chatgpt?.resume(); subscriptions?.resume(); createWindow(url); }
+        else showDesktop();
 	});
-	createWindow(url);
+	createWindow(url, !openDesktopOnReady && Boolean(mobileCompanion));
 	log(`window open: ${url}`);
 	// First update check AFTER the window exists (the downloaded-banner
 	// push needs a listener); dev builds no-op (no autoUpdater).

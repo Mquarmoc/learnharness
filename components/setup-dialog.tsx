@@ -32,6 +32,7 @@
  * CMU title, z-50.
  */
 
+import { useMobileCompanion } from "@/components/mobile-companion";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useBackdropDismiss } from "@/components/backdrop-dismiss";
@@ -217,7 +218,20 @@ export function SetupKeysBody({
 	);
 }
 
-export function SetupDialog({
+export function SetupDialog(props: { open: boolean; onClose: () => void; onDone: (models: ModelsSettings) => void }) {
+    const mobile = useMobileCompanion();
+    if (!mobile) return <DesktopSetupDialog {...props} />;
+    if (!props.open) return null;
+    return <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/90 p-6" role="dialog" aria-modal="true" aria-labelledby="mobile-setup-title">
+        <div className="max-w-md rounded-lg border border-border bg-card p-5">
+            <h2 id="mobile-setup-title" className="text-xl">Finish setup on the PC</h2>
+            <p className="my-4">Connect your model account and choose your models in the desktop app. Then reload this page. Your draft stays here.</p>
+            <button onClick={props.onClose} className="min-h-11 rounded-lg border border-border px-4">Back to lesson</button>
+        </div>
+    </div>;
+}
+
+function DesktopSetupDialog({
 	open,
 	onClose,
 	/** Saved: the models section landed; the caller marks configured (the

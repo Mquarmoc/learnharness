@@ -24,7 +24,7 @@
  * leaked server holds its port against the next run (learned the hard
  * way, same day).
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { probeEnv, verifyDemoRuntime } from "./smoke-demo-runtime.mjs";
 import { verifyProviderRuntime } from "./smoke-provider-runtime.mjs";
 import { createRequire } from "node:module";
@@ -83,6 +83,8 @@ async function main() {
 	verifyDemoRuntime(STANDALONE, RUNTIME);
 	// /api/models only reads catalogs; initialize the real lazy SDK offline too.
 	verifyProviderRuntime(STANDALONE, RUNTIME);
+    const syntax = spawnSync(process.execPath, [path.join(ROOT, "scripts/smoke-shiki-runtime.mjs"), STANDALONE], { stdio: "inherit", windowsHide: true });
+    if (syntax.status !== 0) throw new Error("Packaged syntax-rendering runtime failed.");
 	const port = await freePort();
 	const url = `http://127.0.0.1:${port}`;
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "lh-smoke-"));
