@@ -30,11 +30,13 @@ import {
 } from "react";
 import remarkBreaks from "remark-breaks";
 import {
+  defaultRehypePlugins,
   Streamdown,
   type PluginConfig,
+  type StreamdownProps,
 } from "streamdown";
 import { mdComponents } from "@/components/md-blocks";
-import { transformMathDelimiters } from "@/src/core";
+import { repairMathForDisplay, transformMathDelimiters } from "@/src/core";
 
 export type MessageProps = HTMLAttributes<HTMLDivElement> & {
   from: LhViewMessage["role"];
@@ -355,6 +357,25 @@ export const streamdownPlugins = {
   math: createMathPlugin({ singleDollarTextMath: true }),
 } as unknown as PluginConfig;
 
+// Remend's incomplete-HTML heuristic mistakes `<b` in `$a<b$` for a
+// partial tag and deletes the remaining source before math can tokenize.
+// Preserve that text (unfinished prose HTML may show literally); Streamdown's
+// separate sanitization/hardening and all other Markdown repairs stay enabled.
+export const streamdownRemend = { htmlTags: false };
+
+// Model output must not load remote images: a rendered
+// ![x](https://host/?d=...) sends data out with no click. Streamdown's
+// default harden step allows every image prefix, so this keeps its
+// raw → sanitize → harden pipeline and changes one option. A blocked image
+// becomes an "[Image blocked: alt]" badge. data: images were already
+// blocked by the sanitize step; the app's image and SVG cards don't render
+// through markdown. Links are unchanged.
+const [hardenPlugin, hardenOptions] = defaultRehypePlugins.harden as [unknown, Record<string, unknown>];
+export const streamdownRehypePlugins = Object.values({
+  ...defaultRehypePlugins,
+  harden: [hardenPlugin, { ...hardenOptions, allowedImagePrefixes: [] }],
+}) as NonNullable<StreamdownProps["rehypePlugins"]>;
+
 export const MessageResponse = memo(
   ({ className, children, ...props }: MessageResponseProps) => {
     // Legacy backslash delimiters are converted in a single linear scan;
@@ -375,6 +396,8 @@ export const MessageResponse = memo(
         )}
         components={mdComponents}
         plugins={streamdownPlugins}
+        rehypePlugins={streamdownRehypePlugins}
+        remend={streamdownRemend}
         {...props}
       >
         {content}
@@ -387,6 +410,16 @@ export const MessageResponse = memo(
 );
 
 MessageResponse.displayName = "MessageResponse";
+
+/** Recovery is a tool-text presentation concern, not a shape/answer-data
+ * transform. Ordinary assistant/user prose keeps MessageResponse unchanged. */
+export function ToolContentResponse({ children, ...props }: MessageResponseProps) {
+  return (
+    <MessageResponse {...props}>
+      {typeof children === "string" ? repairMathForDisplay(children) : children}
+    </MessageResponse>
+  );
+}
 
 export type MessageToolbarProps = ComponentProps<"div">;
 

@@ -8,7 +8,7 @@ const quiz = { id: "saved-question", role: "assistant", content: [{ type: "toolC
 
 test("a saved idle question recovers a disconnected view without opening another stream", async () => {
  let streams = 0, settled = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   onReattachSettled: () => { settled++; },
   fetch: async input => {
    if (String(input).endsWith("/stream")) { streams++; throw new TypeError("network error"); }
@@ -25,7 +25,7 @@ test("a saved idle question recovers a disconnected view without opening another
 
 test("a browser NetworkError can recover through the saved lesson", async () => {
  let streams = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async input => {
    if (String(input).endsWith("/stream")) {
     streams++; throw new DOMException("network error", "NetworkError");
@@ -40,7 +40,7 @@ test("a browser NetworkError can recover through the saved lesson", async () => 
 });
 
 test("a later successful idle snapshot clears an exhausted connection error", async () => {
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async () => { throw new TypeError("network error"); },
  });
  await model.resumeStream(false);
@@ -52,7 +52,7 @@ test("a later successful idle snapshot clears an exhausted connection error", as
 
 test("a failed send allows an explicit learner retry rather than silently discarding it", async () => {
  let posts = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [],
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async (_input, init) => {
    if (init?.method === "POST") {
     if (++posts === 1) throw new TypeError("network error");
@@ -76,7 +76,7 @@ test("snapshot recovery preserves access refusal and saved provider failures", a
  refused.setMessages([quiz]);
  assert.match(refused.getState().error!.message, /Phone access refused/);
  const failed = { ...quiz, content: [], stopReason: "error", errorMessage: "ChatGPT usage limit reached." } as LhMessage;
- const disconnected = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const disconnected = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async () => { throw new TypeError("network error"); },
  });
  await disconnected.resumeStream(false);

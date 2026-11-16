@@ -4,14 +4,17 @@ import { SessionModel } from "../components/session-core.ts";
 
 const wire = (events: unknown[]) => events.map(e => "data: " + (e === "[DONE]" ? e : JSON.stringify(e)) + "\n\n").join("");
 const message = { role: "assistant", content: [{ type: "text", text: "Recovered lesson." }], stopReason: "stop", timestamp: 1, provider: "fixture", model: "fixture", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 } };
+// Since 0.6.1 a finished stream is reconciled against the saved record, so the
+// fake server saves what it streamed: empty and in flight until the replay ran.
+const savedRecord = (replayed: boolean, before: unknown[] = []) => Response.json({ messages: replayed ? [...before, { ...message, id: "saved-lesson" }] : before, turnInFlight: !replayed });
 
 for (const failure of ["network", "eof"] as const) test(`reattach recovers ${failure} with GET replay and no duplicated answer or lesson`, async () => {
  let streams = 0, posts = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async (input, init) => {
    const url = String(input);
    if (init?.method === "POST") { posts++; return Response.json({ ok: true }); }
-   if (!url.endsWith("/stream")) return Response.json({ messages: [] });
+   if (!url.endsWith("/stream")) return savedRecord(streams >= 2);
    streams++;
    if (streams === 1) {
     if (failure === "network") throw new TypeError("network error");
@@ -30,7 +33,7 @@ for (const failure of ["network", "eof"] as const) test(`reattach recovers ${fai
 
 test("authentication refusal is surfaced without repeated requests", async () => {
  let requests = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async () => { requests++; return new Response("Phone pairing expired.", { status: 401 }); },
  });
  await model.resumeStream(false);
@@ -40,19 +43,19 @@ test("authentication refusal is surfaced without repeated requests", async () =>
 
 test("persistent network failure is bounded", async () => {
  let requests = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async () => { requests++; throw new TypeError("network error"); },
  });
  await model.resumeStream(false);
  assert.equal(requests, 4);
- assert.match(model.getState().error!.message, /network error/);
+ assert.match(model.getState().error!.message, /connection dropped/);
 });
 
 test("a stream body failing after a partial response replays without duplicating it", async () => {
  let streams = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 0, reconnectAttempts: 3,
   fetch: async input => {
-   if (!String(input).endsWith("/stream")) return Response.json({ messages: [] });
+   if (!String(input).endsWith("/stream")) return savedRecord(streams >= 2);
    streams++;
    if (streams === 1) {
     let reads = 0;
@@ -74,7 +77,7 @@ test("stop during reconnect backoff prevents any further fetch", async () => {
  let requests = 0;
  let failed!: () => void;
  const firstFailure = new Promise<void>(resolve => { failed = resolve; });
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 50,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [], pollMs: 50, reconnectAttempts: 3,
   fetch: async () => { requests++; failed(); throw new TypeError("network error"); },
  });
  const pending = model.resumeStream(false);
@@ -91,7 +94,8 @@ test("provider failure is preserved and never triggers a new provider request or
  let streams = 0;
  const failed = { ...message, content: [], stopReason: "error", errorMessage: "ChatGPT request failed." };
  const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [],
-  fetch: async () => {
+  fetch: async input => {
+   if (!String(input).endsWith("/stream")) return Response.json({ messages: [{ ...failed, id: "saved-failure" }], turnInFlight: false });
    streams++;
    return new Response(wire([{ type: "message_start", message: failed }, { type: "message_end", message: failed }, "[DONE]"]));
   },
@@ -121,10 +125,10 @@ test("a quiz answer stays saved exactly once across a dropped stream and replay"
  const answer = { correct: true } as never;
  const record = [quiz, { ...newAnswerResult("call-fixture", "quiz", answer), id: "saved-answer" }];
  let posts = 0, streams = 0;
- const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [quiz as never], pollMs: 0,
+ const model = new SessionModel({ chatId: "chat_fixture", initialMessages: [quiz as never], pollMs: 0, reconnectAttempts: 3,
   fetch: async (input, init) => {
    if (init?.method === "POST") { posts++; assert.equal(JSON.parse(init.body as string).input.type, "answer"); return Response.json({ ok: true }); }
-   if (!String(input).endsWith("/stream")) return Response.json({ messages: record });
+   if (!String(input).endsWith("/stream")) return savedRecord(streams >= 2, record);
    if (++streams === 1) throw new TypeError("network error");
    return new Response(wire([{ type: "message_start", message }, { type: "message_end", message }, "[DONE]"]));
   },

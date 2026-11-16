@@ -4,15 +4,31 @@
  * Part of the domain-split contracts (src/core/contracts/): each domain file
  * is owned outright by its stream — cross-domain schema changes go through
  * master. Pure types + protocol docs + tiny pure helpers; type-only imports
- * of "ai" (safe everywhere: server, client, tests). See docs/vision.md.
+ * of "ai" (safe everywhere: server, client, tests). See docs/archive/vision.md.
  */
 import type { CallUsage } from "./chat.ts";
+import type { PluginBackgroundResult } from "../plugin-workers.ts";
 import type { LhMessage, LhMarkerMessage } from "../native-messages.ts";
 import { newHandoffMessage } from "../native-messages.ts";
 
-// ─── Async sub-agent jobs (vision §2.5; plan.md Wave 0 protocol) ────────────
+// ─── Async sub-agent jobs (docs/archive/vision.md §2.5; docs/archive/plan.md Wave 0 protocol) ────────────
 
-export type JobKind = "research" | "demo" | "visual" | "pdf";
+export type BuiltinJobKind = "research" | "demo" | "visual" | "pdf";
+export type JobKind = BuiltinJobKind | "plugin";
+export function isBuiltinJobKind(kind: JobKind): kind is BuiltinJobKind {
+	return kind !== "plugin";
+}
+/** Host-owned durable linkage. Never contains filesystem paths. */
+export interface PluginJobMetadata {
+	pluginId: string;
+	toolName: string;
+	workerId: string;
+	requestId: string;
+	taskId?: string;
+	input?: unknown;
+	label?: string;
+}
+export type JobResult = ResearchResult | DemoResult | VisualResult | PdfResult | PluginBackgroundResult;
 export type JobStatus = "running" | "done" | "error";
 
 export interface JobRecord {
@@ -21,6 +37,13 @@ export interface JobRecord {
 	chatId: string;
 	/** The tool part this job fulfills. */
 	toolCallId: string;
+	/** Dispatch-time arguments, saved before spawn. Older jobs resolve from history. */
+	input?: unknown;
+	/** Session-owned delivery, independent of the worker's terminal outcome.
+	 * A failure notice uses error text, never an invented result or learner abort.
+	 * Absent on legacy records: old terminal jobs must never be replayed. */
+	delivery?: { kind: "result" | "abort" | "failure"; status: "pending" | "delivered" };
+	/** Worker computation only; a pending delivery does not keep it running. */
 	status: JobStatus;
 	/** Latest human-readable activity line, e.g. `web_search: "sigma.js v3"`. */
 	activity: string;
@@ -34,16 +57,14 @@ export interface JobRecord {
 	 * inferred at read time (core/prices.ts). Absent on pre-2026-09 jobs and
 	 * until the runner's capture lands — renderers show "—", never zero. */
 	usage?: JobUsage;
+	plugin?: PluginJobMetadata;
 }
 
-/** A sub-agent run's accumulated usage — the same accounting shape as a
- * chat turn (contracts/chat.ts CallUsage), flattened to one running total
- * plus a step count. Token fields are optional exactly like CallUsage: a
- * field NO model call reported stays undefined — absent is not zero (the
- * money-channel doctrine; cost renders "—", never $0). */
+/** Accumulated model usage for one worker run: token totals plus a call
+ * count, with optional per-call accounting. As with CallUsage, a token field
+ * no call reported remains undefined; missing usage must not imply zero cost. */
 export interface JobUsage {
-	/** The model that ran the sub-agent, provider-qualified ("provider:id" —
-	 *  model slots wave, 2026-09-20; matches Pi catalog lookup keys). */
+	/** Provider-qualified model identity (provider:id) for catalog lookup. */
 	model: string;
 	/** Running totals summed over the run's model calls so far. */
 	inputTokens: number | undefined;
@@ -57,12 +78,9 @@ export interface JobUsage {
 	calls?: CallUsage[];
 	/** How many model calls the run has made (each bills separately). */
 	steps: number;
-	/** The MOST RECENT model call's accounting (2026-09 dock contract): the
-	 *  per-blob context line reads last-step input+output against the
-	 *  model's LIVE catalog limit (server-joined onto the activity feed —
-	 *  never the cumulative totals, never a client-side table). Absent
-	 *  until the first call completes; absent provider fields stay absent
-	 *  (never zero). */
+	/** Most recent completed model call's accounting, used for current context
+	 * usage rather than cumulative totals. Absent until a call completes;
+	 * unreported provider fields remain undefined. */
 	lastStep?: CallUsage;
 }
 
@@ -148,42 +166,32 @@ export function accumulateJobUsage(
  *     sourced briefs) — tracking a live activity line in the job record.
  *     ONE central client poll of GET /api/jobs?chatId=… (in Chat) drives every
  *     job surface: the transcript dispatch cards (live activity by
- *     toolCallId, quiet one-liner after delivery), the sub-agents sidebar
+ *     toolCallId, quiet one-liner after worker completion), the sub-agents sidebar
  *     panel, and the single re-sync when a job settles.
  *
- *  3. On completion the runner builds a STEER MESSAGE (buildSubagentSteer)
- *     and hands it to the wake pipeline (src/server/jobs.ts): a user-role
- *     result-carrying native marker — the content is what the MODEL needs
- *     (the research brief, the builder's notes), plus a data-subagent-artifact
- *     part with what the UI renders (the full result: brief + sources /
- *     SVG / demo HTML). Provider conversion drops data parts, so artifact
- *     payloads never enter the teacher's context. metadata.subagentResult
- *     identifies the job; the UI renders these as sub-agent result cards,
- *     NEVER as learner interjections.
+ *  3. Dispatch saves input on the job before spawn. On completion the
+ *     runner saves result + terminal worker status + pending delivery in
+ *     one job update, then queues buildSubagentSteer WITHOUT waiting for
+ *     delivery. The native custom marker's content is model-facing text;
+ *     details carry the full artifact payload for the UI. Worker resources
+ *     are released even if a question keeps the result pending indefinitely.
+ *     Only computing workers appear in Background agents or accept abort.
  *
- *  4. The wake pipeline delivers the steer by firing a SERVER-SIDE teacher
- *     turn through the same turn composition as a client request
- *     (handleChatRequest) — write-ahead persist, turn liveness, extraction
- *     trigger: one code path. A per-chat serialized queue: a steer waits
- *     while a turn is in flight OR a question tool part is pending (an
- *     unanswered client-side tool call breaks provider conversion — the
- *     steer fires right after the learner's continuation), then fires; a 409
- *     (a client turn raced in) retries. Delivery is idempotent per jobId, so
- *     a crashed wake can be re-entered by the stale-job recovery sweep. The
- *     job's status flips to done/error only AFTER the wake turn completes —
- *     a polling client that sees the flip re-syncs once and gets the
- *     finished record.
+ *  4. Session delivery owns one registry entry per deterministic steer ID,
+ *     including while a wake is in flight or a 409/403 returns its cargo.
+ *     A live agent takes it via pi steering; registration restores saved
+ *     pending jobs before the answer run's first poll. Otherwise the idle
+ *     wake uses the normal turn composition and respects pending questions,
+ *     dismissal, and background consent. A saved transcript marker completes
+ *     delivery; HTTP 200 or streamed visibility alone does not.
  *
- *     CONTINUATION COALESCING: the idle window above can starve — a
- *     quiz-chaining teacher ends every turn with a new pending check, so
- *     the gates never stay open long enough for a wake to fire. The fix:
- *     when a client turn wins the turn registry, the handler CLAIMS every
- *     queued, undelivered steer (jobs.ts claimSteers) and appends it after
- *     the learner's answer in that very turn — conversion-safe, because the
- *     answered quiz carries its output. Every answer flushes pending
- *     steers immediately; the wake pump remains for turns that end with no
- *     pending question. The pump re-checks steerDelivered right before
- *     firing, so a claim racing the pump converges to exactly one delivery.
+ *     Failed starts remain quietly pending until a learner run or restart
+ *     recovery, without new timers, visible delivery errors, or worker-status
+ *     changes. Existing 409 backoff and consent deferral remain. Accepted
+ *     turns are never automatically replayed. Legacy running records with a
+ *     result become finished/pending; legacy terminal records with no
+ *     delivery metadata remain untouched. Session deletion discards pending
+ *     deliveries rather than treating them as running work.
  *
  *  5. No pending job parts ever exist, so the composer never gates on jobs
  *     (the learner can interject mid-job; the steer queues behind their
@@ -199,7 +207,19 @@ export interface ResearchToolInput {
 
 export interface ResearchResult {
 	brief: string;
+	/** Rendered as links, so only http(s) URLs belong here (isWebSourceUrl).
+	 *  Records saved before that rule may still hold other schemes. */
 	sources: { title: string; url: string }[];
+}
+
+/** True for http(s) URLs: the only research sources that become links. */
+export function isWebSourceUrl(url: string): boolean {
+	try {
+		const { protocol } = new URL(url);
+		return protocol === "http:" || protocol === "https:";
+	} catch {
+		return false;
+	}
 }
 
 export interface DemoToolInput {
@@ -220,12 +240,19 @@ export interface DemoResult {
 export interface VisualToolInput {
 	/** Precise brief for ONE visual (what it must show, exactly). */
 	brief: string;
+	/** A learner image file to annotate (issue #363): the maker draws its
+	 *  marks on top of it instead of authoring a figure from scratch. */
+	image?: string;
 }
 
 export interface VisualResult {
-	/** Complete SVG markup (verified by the maker looking at the render). */
+	/** Complete SVG markup (verified by the maker looking at the render).
+	 *  Annotation SVGs retain a learner-image placeholder; image identifies the session snapshot. */
 	svg: string;
 	notes?: string;
+	/** Present when the figure annotates a learner image: its absolute
+	 *  path. Photos never invert, so the card hides the switch. */
+	image?: { path: string; snapshotId: string };
 }
 
 /** The pdf-reader (sources v0, 2026-09): reads a learner-provided PDF on
@@ -276,12 +303,14 @@ export interface SubagentResultMeta {
 	 * the teacher is told so its promise of a result doesn't hang
 	 * silently in the lesson. */
 	aborted?: true;
+	/** Delivery/recovery failure, not a learner abort or fabricated task outcome. */
+	failure?: string;
 }
 
 /** The data-subagent-artifact part payload: what the UI renders. */
 export interface SubagentArtifactData {
 	kind: JobKind;
-	result: ResearchResult | DemoResult | VisualResult | PdfResult;
+	result: JobResult;
 	/** The learner's pinned UI state (invert switch) riding the record. */
 	ui?: { inverted?: boolean };
 }
@@ -289,7 +318,7 @@ export interface SubagentArtifactData {
 /** A result steer's marker details: the UI's meta + artifact in one
  *  payload (the projection splits it into metadata + data part). */
 export interface SteerDetails extends SubagentResultMeta {
-	result: ResearchResult | DemoResult | VisualResult | PdfResult;
+	result: JobResult;
 	/** LEARNER UI state pinned onto the artifact (owner, 2026-10-07): the
 	 *  invert switch's position, persisted so navigating away and back (or
 	 *  restarting) keeps it. A VIEW preference — never enters the teacher's
@@ -320,8 +349,9 @@ export type SteerMessage = LhMarkerMessage;
 /** Whether a result is the failure shape (html/svg empty, failure brief). */
 export function isSubagentFailure(
 	kind: JobKind,
-	result: ResearchResult | DemoResult | VisualResult | PdfResult,
+	result: JobResult,
 ): boolean {
+	if (kind === "plugin") return (result as PluginBackgroundResult).outcome.status !== "succeeded";
 	if (kind === "research") {
 		const r = result as ResearchResult;
 		return r.sources.length === 0 && /^Research failed:/i.test(r.brief);
@@ -339,7 +369,8 @@ export function isSubagentFailure(
 }
 
 /** The model-facing text of a steer: what the result IS, what to do with it. */
-function steerText(kind: JobKind, result: ResearchResult | DemoResult | VisualResult | PdfResult): string {
+function steerText(kind: JobKind, result: JobResult): string {
+	if (kind === "plugin") return (result as PluginBackgroundResult).text;
 	if (isSubagentFailure(kind, result)) {
 		if (kind === "research")
 			return `${(result as ResearchResult).brief}\n\nContinue with what you can establish and flag the uncertainty to the learner.`;
@@ -359,6 +390,10 @@ function steerText(kind: JobKind, result: ResearchResult | DemoResult | VisualRe
 		return `The demo "${(result as DemoResult).title}" is built, headlessly tested, and rendered in the lesson. Builder notes: ${
 			(result as DemoResult).notes ?? "(none)"
 		}.\nTeach with it — reference its controls by name and point the learner at what to try.`;
+	if ((result as VisualResult).image)
+		return `The annotated image is drawn, verified by inspection, and rendered in the lesson. Maker notes: ${
+			(result as VisualResult).notes ?? "(none)"
+		}.\nReference its marks as you teach.`;
 	return `The figure is drawn, verified by inspection, and rendered in the lesson. Maker notes: ${
 		(result as VisualResult).notes ?? "(none)"
 	}.\nReference its elements as you teach.`;
@@ -371,7 +406,7 @@ function steerText(kind: JobKind, result: ResearchResult | DemoResult | VisualRe
  */
 export function buildSubagentSteer(
 	job: Pick<JobRecord, "id" | "kind" | "toolCallId">,
-	result: ResearchResult | DemoResult | VisualResult | PdfResult,
+	result: JobResult,
 ): SteerMessage {
 	return {
 		id: `steer_${job.id}`,
@@ -407,9 +442,23 @@ export function buildAbortSteer(
 	};
 }
 
+/** Honest pipeline failure: same deterministic marker id, no invented task result. */
+export function buildJobFailureSteer(
+	job: Pick<JobRecord, "id" | "kind" | "toolCallId">,
+	failure: string,
+): SteerMessage {
+	return {
+		id: `steer_${job.id}`, role: "custom", customType: "subagent-abort", display: true,
+		content: `Background job recovery or delivery failed: ${failure}. No worker outcome can be asserted. Acknowledge the failure and continue without waiting for this result.`,
+		details: { jobId: job.id, kind: job.kind, toolCallId: job.toolCallId, failure },
+		timestamp: Date.now(),
+	};
+}
+
 /** What the teacher reads: one line telling it the result is not coming,
  * how to acknowledge, and that re-dispatching is allowed. */
 function abortText(kind: JobKind): string {
+	if (kind === "plugin") return "The learner aborted the background job before computation completed. Acknowledge it briefly and continue without waiting for a result.";
 	if (kind === "research")
 		return "Research aborted — the learner aborted the research job, so no brief is coming. Acknowledge it in one line and continue teaching without it (or offer to re-dispatch it).";
 	if (kind === "demo")
@@ -419,7 +468,7 @@ function abortText(kind: JobKind): string {
 	return "The figure job was aborted by the learner — no figure is coming. Acknowledge it in one line and teach without it (a re-dispatch is fine if the learner wants it).";
 }
 
-// ─── the probe handoff steer (the probe→teach split, docs/probe-teach-split.md §2) ──
+// ─── the probe handoff steer (the probe→teach split, docs/archive/probe-teach-split.md §2) ──
 //
 // probe_done's execute queues this through the same wake pipeline; the
 // pump fires it once the prober's turn ends (gates + grace). It carries no

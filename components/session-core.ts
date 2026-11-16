@@ -17,6 +17,10 @@ import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import {
 	needsContinuation,
+	activeProblemOf,
+	activeProblemOccurrenceOf,
+	pendingQuestionOf,
+	failedResponseAtEnd,
 	measuredContextTokens,
 	newAnswerResult,
 	newNextMessage,
@@ -30,8 +34,40 @@ import {
 	type LhViewMessage,
 	type LiveExecution,
 	type QuestionAnswerData,
+	type QuestionDraft,
+	type TurnUsage,
+	type SessionPricing,
 } from "../src/core";
 
+import { copyImmutableData, pendingPluginQuestionOf, pluginQuestionCallsOf } from "../src/core/index.ts";
+import { pluginQuestionOccurrenceKey, samePluginQuestionOccurrence, type PluginQuestionAnswerState, type PluginQuestionSnapshot, type PluginQuestionOccurrence } from "../src/core/index.ts";
+
+import type { PluginProblemSnapshot, PluginProblemSubmissionState } from "../src/core/index.ts";
+
+export interface PluginProblemAvailability { problemId: string; status: "available" | "unavailable" }
+export interface PluginProblemDraft { submission: PluginProblemSubmissionState; thinking: string }
+export interface PluginQuestionAvailability { questionId: string; status: "available" | "unavailable" }
+export interface SessionRecordSnapshot {
+	pluginProblemAvailability?: PluginProblemAvailability;
+	messages: LhMessage[];
+	turnError?: string;
+	pluginQuestionAvailability?: PluginQuestionAvailability;
+	turnInFlight?: boolean;
+	turns?: TurnUsage[];
+	pricing?: SessionPricing;
+}
+export interface SessionRecordReadOptions {
+	adoption?: "replace" | "append" | "none";
+	signal?: AbortSignal;
+	/** Local React cancellation must be checked after the complete body read. */
+	isCurrent?: () => boolean;
+	/** Internal pre-replay/terminal reads may replace while status is busy. */
+	allowInFlight?: boolean;
+	recoveringDrop?: boolean;
+	/** Preserve reattach's existing non-OK-record replay fallback. */
+	tolerateHttpFailure?: boolean;
+}
+export interface PluginQuestionDraft { answer: PluginQuestionAnswerState; thinking: string; readingThinking: string }
 export type SessionStatus = "ready" | "submitted" | "streaming" | "error";
 
 /** How often to poll turnInFlight while a racing turn runs (409 retry). */
@@ -39,17 +75,15 @@ export const TURN_POLL_MS = 500;
 /** Give up waiting (a wake turn can run long) and surface the 409. */
 export const TURN_WAIT_MAX_MS = 30_000;
 
-function isConnectionFailure(error: unknown): boolean {
-	return error instanceof TypeError || (error instanceof Error &&
-		(error.name === "NetworkError" || /^(network error|failed to fetch)$/i.test(error.message)));
-}
-
 export interface SessionModelDeps {
 	/** Injectable fetch (tests); defaults to the global. */
 	fetch?: typeof globalThis.fetch;
 	/** Injectable retry timing (tests). */
 	pollMs?: number;
 	waitMaxMs?: number;
+	/** Extra read-only replays of a dropped turn, with backoff. The phone
+	 *  companion asks for some (its link drops often); the default is none. */
+	reconnectAttempts?: number;
 }
 
 /** A local optimistic id (never a server stamp — absorption and the
@@ -83,13 +117,31 @@ async function turnInFlight(model: SessionModel): Promise<boolean | null> {
 	}
 }
 
-/** One wire event off the SSE body: parsed JSON, or the [DONE] terminal. */
-async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
+const STREAM_DROPPED = "The connection dropped before the turn completed.";
+
+/** Mark transport failures without confusing JSON/application bugs with drops. */
+class StreamReadError extends Error {
+	constructor(cause: unknown) {
+		super(cause instanceof Error ? cause.message : String(cause), { cause });
+	}
+}
+
+/** A dropped transport, as opposed to a refusal or an application error. Only these are retried. */
+function isConnectionFailure(error: unknown): boolean {
+	return error instanceof StreamReadError || error instanceof TypeError || (error instanceof Error &&
+		(error.name === "NetworkError" || /^(network error|failed to fetch)$/i.test(error.message)));
+}
+
+/** Wire events; return true ONLY for the explicit completion marker. */
+export async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<Record<string, unknown>, boolean> {
 	const decoder = new TextDecoder();
 	let buf = "";
 	for (;;) {
-		const { done, value } = await reader.read();
-		if (done) throw new TypeError("The turn stream disconnected before completion.");
+		let chunk: ReadableStreamReadResult<Uint8Array>;
+		try { chunk = await reader.read(); }
+		catch (err) { throw new StreamReadError(err); }
+		const { done, value } = chunk;
+		if (done) return false;
 		buf += decoder.decode(value, { stream: true });
 		for (;;) {
 			const end = buf.indexOf("\n\n");
@@ -99,7 +151,7 @@ async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): Asyn
 			const dataLine = event.split("\n").find((l) => l.startsWith("data: "));
 			if (!dataLine) continue;
 			const data = dataLine.slice("data: ".length);
-			if (data === "[DONE]") return;
+			if (data === "[DONE]") return true;
 			yield JSON.parse(data) as Record<string, unknown>;
 		}
 	}
@@ -108,12 +160,13 @@ async function* sseEvents(reader: ReadableStreamDefaultReader<Uint8Array>): Asyn
 /** The dangling question call's tool name (the optimistic answer result's
  *  toolName — the server stamps the same from its own record scan). */
 export function pendingCallTool(messages: readonly LhMessage[], toolCallId: string): string | null {
-	for (const m of messages) {
-		if ((m as { role?: string }).role !== "assistant") continue;
-		const content = (m as { content?: unknown }).content;
-		if (!Array.isArray(content)) continue;
-		for (const block of content as Array<{ type?: string; id?: string; name?: string }>) {
-			if (block.type === "toolCall" && block.id === toolCallId) return block.name ?? null;
+	// Match projection's newest-occurrence pairing for pre-uniquifier records.
+	for (let mi = messages.length - 1; mi >= 0; mi--) {
+		const m = messages[mi]!;
+		if (m.role !== "assistant") continue;
+		for (let bi = m.content.length - 1; bi >= 0; bi--) {
+			const block = m.content[bi]!;
+			if (block.type === "toolCall" && block.id === toolCallId) return block.name;
 		}
 	}
 	return null;
@@ -121,8 +174,9 @@ export function pendingCallTool(messages: readonly LhMessage[], toolCallId: stri
 
 /**
  * Has the record ABSORBED this optimistic tail entry? The write-ahead
- * persists content-identical copies with server-stamped ids — match on the
- * content, not the (local) id; only `c_`-prefixed local entries are ever
+ * normally persists content-identical copies with server-stamped ids — match
+ * content, not the (local) id. Image normalization uses the separate temporary
+ * POST adoption gate, never weaker byte matching. Only `c_` entries are ever
  * absorbed (live turn content is never dropped).
  */
 export function absorbed(m: LhMessage, record: readonly LhMessage[]): boolean {
@@ -131,7 +185,7 @@ export function absorbed(m: LhMessage, record: readonly LhMessage[]): boolean {
 	if (role === "user") {
 		const content = (m as { content?: unknown }).content;
 		return record.some(
-			(r) => (r as { role?: string }).role === "user" && (r as { content?: unknown }).content === content,
+			(r) => (r as { role?: string }).role === "user" && (Array.isArray(content) ? sameDetails((r as { content?: unknown }).content, content) : (r as { content?: unknown }).content === content),
 		);
 	}
 	if (role === "toolResult") {
@@ -167,11 +221,19 @@ function sameDetails(a: unknown, b: unknown): boolean {
 }
 
 export interface SessionState {
+	pluginProblemAvailability?: PluginProblemAvailability;
 	messages: LhViewMessage[];
 	nativeMessages: LhMessage[];
+	canonicalMessages: LhMessage[];
+	/** Server-read history only; optimistic bubbles are not delivery proof. */
+	hasConfirmedConversation: boolean;
 	/** Completed conversation usage; null after compaction or before first usage. */
 	contextTokens: number | null;
 	status: SessionStatus;
+	/** Local submission with optional grading/processing, awaiting its POST response. */
+	evaluating: boolean;
+	reconciliation: "ready" | "syncing" | "failed";
+	pluginQuestionAvailability?: PluginQuestionAvailability;
 	error: { message: string } | null;
 	/** Steers sent but not yet drained (composer steering, 2026-10-03):
 	 *  the queued indicator's truth. An entry dies when its id lands in
@@ -201,6 +263,8 @@ export function visibleQueuedSteers(
 export interface SessionModelOptions extends SessionModelDeps {
 	chatId: string;
 	initialMessages: LhMessage[];
+	/** Retained, memory-only server failure when reopening a session. */
+	initialError?: string;
 	/** Fires on every state change (the hook re-renders). */
 	onChange?: () => void;
 	/** The reattach settled terminal (turn-settled): no turn running, the
@@ -215,6 +279,7 @@ export class SessionModel {
 	/** Steers sent but not yet drained (the queued indicator's truth). */
 	private steerQueueValue: SteerQueueItem[] = [];
 	private readonly pollMs: number;
+	private readonly reconnectAttempts: number;
 	private readonly waitMaxMs: number;
 	private onReattachSettled?: () => void;
 	/** The hook's re-render trigger (set by the adapter). */
@@ -225,6 +290,31 @@ export class SessionModel {
 	// at every full sync; the write-ahead absorbs the optimistic entries.
 	private base: LhMessage[];
 	private tail: LhMessage[] = [];
+	private questionDrafts = new Map<string, QuestionDraft>();
+	private pluginQuestionDrafts = new Map<string, PluginQuestionDraft>();
+	private pluginProblemDrafts = new Map<string, PluginProblemDraft>();
+	private pluginProblemAvailability?: PluginProblemAvailability;
+	private reconciliationValue: SessionState["reconciliation"] = "ready";
+	private pluginQuestionAvailability?: PluginQuestionAvailability;
+	private reconciliationTask: Promise<boolean> | null = null;
+	private reconciliationOwner: AbortController | null = null;
+	// Effect reconnections may have no stream owner on either side of stop().
+	// Their read tasks still belong to distinct connections, unlike data epochs
+	// whose invalidation can legitimately require a current terminal retry.
+	private connectionGeneration = 0;
+	private reconciliationConnectionGeneration = 0;
+	// Shared authority for EVERY canonical GET writer, including independent
+	// Chat refreshes. Issuing a read does not invalidate another response:
+	// only accepted canonical adoption or an action/stream epoch does.
+	private canonicalIssued = 0;
+	private canonicalAcknowledged = 0;
+	private canonicalEpoch = 0;
+	/** Normalized bytes cannot identify an optimistic image entry before its
+	 * POST resolves. Defer transcript adoption only for this live HTTP owner. */
+	private imagePostOwner: AbortController | null = null;
+	private imagePreview: { owner: AbortController; ids: ReadonlySet<string> } | null = null;
+	/** Only learner answers submitted through send(), never silent dismissals. */
+	private unconfirmedAnswers = new Map<string, string>();
 	// The live turn's execution layer (view model mid-turn states):
 	private executions = new Map<string, LiveExecution>();
 	private streamingIds = new Set<string>();
@@ -232,26 +322,41 @@ export class SessionModel {
 	/** The in-flight assistant message's client id (see applyWireEvent). */
 	private streamingMessageId: string | null = null;
 	private statusValue: SessionStatus = "ready";
+	/** Presentation only; never changes admission, persistence or turn ownership. */
+	private evaluationOwner: AbortController | null = null;
 	/** Request/loop failures are transient; provider failures derive from messages. */
 	private errorValue: { message: string } | null = null;
+	/** The current error is an exhausted reconnect: the next good snapshot clears it. */
 	private connectionError = false;
+	/** Dismissing a banner must not authorize an automatic replacement turn. */
+	private automaticContinuationBlocked = false;
 	/** A completed failure from THIS consume, not the previous attempt's record. */
 	private liveFailureId: string | null = null;
 	// The single live consume (POST response or reattach stream): a newer
 	// consume cancels the older — one reader at a time.
 	private consumeAbort: AbortController | null = null;
+	/** Retain the latest request across stop(): an opening POST still owns
+	 * its refusal after view detachment, but never after a newer request. */
+	private latestRequest: AbortController | null = null;
 	/** Synchronous ready check for the gate (send/read mount logic). */
 	readyRef = true;
 
+	private history?: { base: LhMessage[]; tail: LhMessage[]; messages: LhMessage[] };
+
 	constructor(opts: SessionModelOptions) {
 		this.chatId = opts.chatId;
-		this.base = opts.initialMessages;
+		this.base = copyImmutableData(opts.initialMessages);
+		this.tail = copyImmutableData(this.tail);
+		if (pluginQuestionCallsOf(this.base).some(call => call.status === "answerable" || call.status === "unreadable")) { this.reconciliationValue = "syncing"; this.readyRef = false; }
+		this.errorValue = opts.initialError === undefined ? null : { message: opts.initialError };
+		this.automaticContinuationBlocked = opts.initialError !== undefined;
 		// BOUND: the browser's native fetch is a Window method — storing it
 		// unbound makes every call throw "Illegal invocation" in the browser
 		// (Node's undici doesn't care, so the tests never saw it). Always go
 		// through a receiver-preserving wrapper.
 		this.fetch = opts.fetch ?? ((...args) => globalThis.fetch(...args));
 		this.pollMs = opts.pollMs ?? TURN_POLL_MS;
+		this.reconnectAttempts = opts.reconnectAttempts ?? 0;
 		this.waitMaxMs = opts.waitMaxMs ?? TURN_WAIT_MAX_MS;
 		this.onChange = opts.onChange;
 		this.onReattachSettled = opts.onReattachSettled;
@@ -262,26 +367,41 @@ export class SessionModel {
 		this.onReattachSettled = fn;
 	}
 
+	/** Status/dock updates do not change native history. Immutable message
+	 * identities let all historical question readers share the same analysis. */
+	private nativeHistory(): LhMessage[] {
+		if (this.history?.base === this.base && this.history.tail === this.tail) return this.history.messages;
+		const messages = copyImmutableData([...this.base, ...this.tail]);
+		this.history = { base: this.base, tail: this.tail, messages };
+		return messages;
+	}
+
 	getState(): SessionState {
 		const live =
 			this.statusValue === "submitted" || this.statusValue === "streaming"
 				? { executions: this.executions, inFlight: true, streamingIds: this.streamingIds }
 				: undefined;
-		const messages = [...this.base, ...this.tail];
-		const latest = messages.at(-1);
-		// One rule for live and restored failures: only the final completed
-		// assistant can own the banner. While trying again, hide the old
-		// failure from the first Thinking frame, but show a new failure at end.
+		const messages = this.nativeHistory();
+		const latest = failedResponseAtEnd(messages);
+		// Presentation/compaction markers do not resolve a failure. While
+		// trying again, hide the old banner from the first Thinking frame,
+		// but show a new completed failure from this consume immediately.
 		const providerError =
-			latest?.role === "assistant" && latest.stopReason === "error" &&
+			latest !== undefined &&
 			!this.incompleteUsageIds.has(latest.id) && (!live || latest.id === this.liveFailureId)
 				? { message: latest.errorMessage ?? "An error occurred." }
 				: null;
 		return {
 			messages: projectView(messages, live),
 			nativeMessages: messages,
+			canonicalMessages: this.base,
+			hasConfirmedConversation: this.base.some(m => m.role === "user" || m.role === "assistant"),
 			contextTokens: measuredContextTokens(messages, this.incompleteUsageIds),
 			status: this.statusValue,
+			evaluating: this.statusValue === "submitted" && this.evaluationOwner !== null && this.evaluationOwner === this.consumeAbort,
+			reconciliation: this.reconciliationValue,
+			pluginQuestionAvailability: this.pluginQuestionAvailability,
+			pluginProblemAvailability: this.pluginProblemAvailability,
 			error: this.errorValue ?? providerError,
 			steerQueue: this.steerQueueValue,
 		};
@@ -294,26 +414,164 @@ export class SessionModel {
 	/** Mutate model state + notify (the hook re-renders). */
 	private mutate(fn: () => void): void {
 		fn();
+		// Streaming SDK partials and POST inputs remain caller-owned. Detach only
+		// new data, retaining already immutable settled messages and contracts.
+		this.base = copyImmutableData(this.base);
+		this.tail = copyImmutableData(this.tail);
 		this.onChange?.();
 	}
 
 	private setStatus(status: SessionStatus): void {
-		if (status === "submitted") this.liveFailureId = null;
+		if (status === "submitted") { this.liveFailureId = null; this.invalidateCanonicalReads(); }
 		this.statusValue = status;
-		this.readyRef = status === "ready" || status === "error";
+		this.readyRef = status === "ready" && this.reconciliationValue === "ready";
 		this.onChange?.();
 	}
 
 	private setError(message: string | null, connectionError = false): void {
 		this.connectionError = message !== null && connectionError;
 		this.errorValue = message === null ? null : { message };
+		if (message !== null) this.automaticContinuationBlocked = true;
 		this.onChange?.();
+	}
+
+	private invalidateCanonicalReads(): void { this.canonicalEpoch++; }
+
+	private releaseImagePost(owner: AbortController | null): void {
+		if (owner && this.imagePostOwner === owner) {
+			this.imagePostOwner = null;
+			// A GET issued during the deferred interval must not land later.
+			this.invalidateCanonicalReads();
+		}
+	}
+	private retireImagePreview(owner: AbortController | null): void {
+		if (!owner || this.imagePreview?.owner !== owner) return;
+		const ids = this.imagePreview.ids;
+		this.imagePreview = null;
+		this.mutate(() => {
+			this.tail = this.tail.filter(message => !ids.has(message.id));
+			for (const id of ids) this.unconfirmedAnswers.delete(id);
+		});
+	}
+	private imagePostPending(owner: AbortController, pending: boolean): void {
+		if (!pending) { this.releaseImagePost(owner); return; }
+		if (this.consumeAbort !== owner || this.latestRequest !== owner) return;
+		this.imagePostOwner = owner;
+		this.invalidateCanonicalReads();
+	}
+
+	/** Shared canonical read/adoption seam. A stale or locally canceled read
+	 * returns undefined, never a snapshot callers may adopt independently. */
+	async readRecord(options: SessionRecordReadOptions = {}): Promise<SessionRecordSnapshot | undefined> {
+		const ticket = ++this.canonicalIssued;
+		const epoch = this.canonicalEpoch;
+		const response = await this.fetchView(`/api/chats/${encodeURIComponent(this.chatId)}`, options.signal, options.recoveringDrop === true);
+		if (!response.ok) {
+			const detail = await response.text();
+			// A refused phone session must surface, not fall through to a replay.
+			if (response.status === 401 || response.status === 403) throw new Error(detail || "Access refused.");
+			if (options.tolerateHttpFailure) return undefined;
+			throw new Error(detail || "Could not sync the saved session.");
+		}
+		let text: string;
+		try { text = await response.text(); }
+		catch (error) { if (options.recoveringDrop && !options.signal?.aborted) throw new StreamReadError(error); throw error; }
+		const record = JSON.parse(text) as SessionRecordSnapshot;
+		if (!Array.isArray(record.messages)) throw new Error("Could not sync the saved session.");
+		if (epoch !== this.canonicalEpoch || ticket < this.canonicalAcknowledged || options.signal?.aborted || options.isCurrent?.() === false) return undefined;
+		const mode = options.adoption ?? "replace";
+		// Returning undefined also prevents callers from certifying a deferred
+		// append/replace as applied canonical authority. No stale snapshot is queued.
+		if (mode !== "none" && this.imagePostOwner) return undefined;
+		if (mode === "replace" && !options.allowInFlight && (this.statusValue === "submitted" || this.statusValue === "streaming")) return undefined;
+		if (mode === "append") {
+			if (!this.appendMessages(record.messages, record.pluginQuestionAvailability, true, record.pluginProblemAvailability)) return undefined;
+			this.canonicalAcknowledged = Math.max(this.canonicalAcknowledged, ticket);
+		} else if (mode === "replace") {
+			this.canonicalAcknowledged = Math.max(this.canonicalAcknowledged, ticket);
+			this.replaceMessages(record.messages, record.turnError, record.pluginQuestionAvailability, record.pluginProblemAvailability);
+		}
+		return record;
+	}
+
+	/** Read-only canonical adoption: never sends a replacement teacher turn. */
+	async reconcile(): Promise<boolean> {
+		if (this.reconciliationTask && this.reconciliationOwner === this.consumeAbort && this.reconciliationConnectionGeneration === this.connectionGeneration) return this.reconciliationTask;
+		this.reconciliationValue = "syncing";
+		this.readyRef = false;
+		this.onChange?.();
+		const owner = this.consumeAbort;
+		const connection = this.connectionGeneration;
+		const isCurrent = () => this.consumeAbort === owner && this.connectionGeneration === connection;
+		const epoch = this.canonicalEpoch;
+		const requiredTicket = this.canonicalIssued + 1;
+		this.reconciliationOwner = owner;
+		this.reconciliationConnectionGeneration = connection;
+		let task!: Promise<boolean>;
+		task = (async () => {
+			try {
+				const record = await this.readRecord({ allowInFlight: true, isCurrent });
+				if (!isCurrent()) return false;
+				if (this.canonicalEpoch !== epoch) throw new Error("Canonical read was invalidated.");
+				// A newer successfully adopted GET is authority too; a merely
+				// issued/pending read cannot suppress this terminal response.
+				if (!record && this.canonicalAcknowledged < requiredTicket) return false;
+				this.reconciliationValue = "ready";
+				this.readyRef = this.statusValue === "ready";
+				return true;
+			} catch {
+				if (!isCurrent()) return false;
+				if (this.canonicalEpoch === epoch && this.canonicalAcknowledged >= requiredTicket) {
+					this.reconciliationValue = "ready";
+					this.readyRef = this.statusValue === "ready";
+					return true;
+				}
+				this.reconciliationValue = "failed";
+				this.readyRef = false;
+				return false;
+			} finally {
+				if (this.reconciliationTask === task) this.reconciliationTask = null;
+				if (isCurrent()) this.onChange?.();
+			}
+		})();
+		this.reconciliationTask = task;
+		return task;
+	}
+
+	pluginProblemDraft(snapshot: PluginProblemSnapshot): PluginProblemDraft {
+		let draft = this.pluginProblemDrafts.get(snapshot.problemId);
+		if (!draft) { draft = { submission: { status: "empty" }, thinking: "" }; this.pluginProblemDrafts.set(snapshot.problemId, draft); }
+		return draft;
+	}
+
+	pluginQuestionDraft(snapshot: PluginQuestionSnapshot): PluginQuestionDraft {
+		const key = pluginQuestionOccurrenceKey(snapshot.occurrence);
+		let draft = this.pluginQuestionDrafts.get(key);
+		if (!draft) { draft = { answer: { status: "empty" }, thinking: "", readingThinking: "" }; this.pluginQuestionDrafts.set(key, draft); }
+		return draft;
+	}
+
+	async dismissPluginQuestion(occurrence: PluginQuestionOccurrence, questionId?: string): Promise<void> {
+		if (!this.readyRef) return;
+		const current = pluginQuestionCallsOf(this.base).find(call => (call.status === "answerable" || call.status === "unreadable") && samePluginQuestionOccurrence(call.occurrence, occurrence));
+		if (!current || (current.snapshot ? current.snapshot.questionId !== questionId : current.annotation.status !== "unreadable" || (questionId !== undefined && (current.annotation.binding?.questionId ?? current.annotation.identity?.questionId) !== questionId))) return;
+		this.setStatus("submitted");
+		try {
+			const response = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/dismiss`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ input: { type: "dismiss-plugin-question", occurrence, ...(questionId ? { questionId } : {}) } }) });
+			if (!response.ok) throw new Error("The dismissal failed.");
+			await response.text();
+			this.invalidateCanonicalReads();
+			await this.reconcile();
+		} catch (error) { this.setError((error as Error).message); }
+		finally { this.setStatus("ready"); }
 	}
 
 	/** The 409 identity-retry fetch (the Wave B contract): the event was
 	 *  never persisted (write-ahead happens only on acceptance), so the
-	 *  retry waits out the running turn and re-POSTs the SAME body. */
-	async postInputEvent(input: ChatInput, signal?: AbortSignal): Promise<Response> {
+	 *  retry waits out the running turn and re-POSTs the SAME body. Plugin
+	 *  question answers are excluded: a busy refusal needs explicit retry,
+	 *  never an automatic second grading attempt. */
+	async postInputEvent(input: ChatInput, signal?: AbortSignal, onPostPending?: (pending: boolean) => void): Promise<Response> {
 		const body = JSON.stringify({ chatId: this.chatId, input });
 		const init: RequestInit = {
 			method: "POST",
@@ -321,7 +579,13 @@ export class SessionModel {
 			body,
 			signal,
 		};
-		let response = await this.fetch("/api/chat", init);
+		const post = async () => {
+			onPostPending?.(true);
+			try { return await this.fetch("/api/chat", init); }
+			finally { onPostPending?.(false); }
+		};
+		let response = await post();
+		if (input.type === "plugin-question-answer" || input.type === "plugin-problem-submission") return response;
 		let waited = 0;
 		while (response.status === 409) {
 			await response.body?.cancel().catch(() => {});
@@ -330,7 +594,7 @@ export class SessionModel {
 			waited += this.pollMs;
 			if (signal?.aborted) return response;
 			if ((await turnInFlight(this)) !== false) continue;
-			response = await this.fetch("/api/chat", init); // may 409 again → loop
+			response = await post(); // may 409 again → loop
 		}
 		return response;
 	}
@@ -353,6 +617,12 @@ export class SessionModel {
 		}
 		const agent = event as unknown as AgentEvent;
 		switch (agent.type) {
+			case "agent_start":
+				// Positive evidence of a new/replayed server-owned turn. Any
+				// later failure in that replay blocks continuation again.
+				this.automaticContinuationBlocked = false;
+				if (this.errorValue !== null) this.setError(null);
+				return false;
 			case "message_start":
 			case "message_update":
 			case "message_end": {
@@ -369,6 +639,10 @@ export class SessionModel {
 					// live stream dropped the marker until the settle sync.
 					const mid = message.id;
 					if (mid === undefined) return false;
+					// Adoption/refetch may already carry this durable message before
+					// its start/end is replayed. The record owns that identity;
+					// adding it to the tail would duplicate it until the next sync.
+					if (this.base.some((m) => m.id === mid)) return false;
 					this.mutate(() => {
 						const idx = this.tail.findIndex((m) => m.id === mid);
 						this.tail =
@@ -420,7 +694,7 @@ export class SessionModel {
 				// The execution layer: clean question placeholders are IGNORED
 				// downstream (view.ts fork 2); errors keep their validation text.
 				const result = agent.result as
-					| { content?: Array<{ type?: string; text?: string }>; details?: unknown }
+					| Pick<ToolResultMessage, "content" | "details">
 					| null;
 				const text = result?.content?.find((c) => c.type === "text")?.text ?? "The tool call failed.";
 				this.mutate(() => {
@@ -428,6 +702,7 @@ export class SessionModel {
 						isError: agent.isError,
 						output: result?.details,
 						errorText: text,
+						...(result ? { result: { content: result.content, details: result.details, isError: agent.isError } } : {}),
 					});
 				});
 				return true; // the execution layer updated the tool part's card
@@ -452,18 +727,27 @@ export class SessionModel {
 
 	/** Consume one SSE body to its [DONE] terminal. The turn-settled
 	 *  terminal (stream-route only) fires the settle hook and ends. */
-	async consumeStream(res: Response, controller = this.consumeAbort): Promise<void> {
+	async consumeStream(res: Response, controller = this.consumeAbort, allowRecovery = true): Promise<void> {
 		if (!res.body) throw new Error("The turn stream body is empty.");
 		const reader = res.body.getReader();
 		let sawEvent = false;
+		let sawDone = false;
 		try {
-			for await (const event of sseEvents(reader)) {
+			const events = sseEvents(reader);
+			for (;;) {
+				let next: IteratorResult<Record<string, unknown>, boolean>;
+				try { next = await events.next(); }
+				catch (err) {
+					if (err instanceof StreamReadError) break;
+					throw err;
+				}
 				if (this.consumeAbort !== controller) return;
+				if (next.done) { sawDone = next.value; break; }
+				const event = next.value;
 				if (event.type === "turn-settled") {
 					// The raced-settle terminal: no turn to attach to — the
 					// record is current; the settle hook refetches.
-					await reader.cancel().catch(() => {});
-					if (this.consumeAbort === controller) this.onReattachSettled?.();
+					sawDone = true;
 					return;
 				}
 				const acted = this.applyWireEvent(event);
@@ -473,13 +757,36 @@ export class SessionModel {
 				}
 			}
 		} finally {
+			await reader.cancel().catch(() => {});
+			reader.releaseLock();
 			// A cancelled consume may finish after its replacement has entered
 			// Thinking. Only the current owner can settle shared state.
 			if (this.consumeAbort === controller) {
 				this.streamingIds = new Set();
 				this.executions = new Map();
-				if (this.statusValue !== "error") this.setStatus("ready");
+				if (sawDone) {
+					// Do not expose live annotations as canonical editor authority.
+					await this.reconcile();
+					if (this.consumeAbort === controller && this.statusValue !== "error") this.setStatus("ready");
+					if (this.consumeAbort === controller && this.reconciliationValue === "ready") this.onReattachSettled?.();
+				}
 			}
+		}
+		if (this.consumeAbort !== controller || sawDone) return;
+		if (!allowRecovery) throw new StreamReadError(new Error(STREAM_DROPPED));
+		// One read-only recovery: refresh the canonical base, then replay the
+		// SAME server-owned turn. Never resend the learner's input.
+		await this.resumeStream(true, false);
+	}
+
+	private async fetchView(url: string, signal: AbortSignal | undefined, recoveringDrop: boolean): Promise<Response> {
+		try {
+			const res = await this.fetch(url, { signal });
+			if (recoveringDrop && !res.ok) throw new Error((await res.text()) || STREAM_DROPPED);
+			return res;
+		} catch (err) {
+			if (recoveringDrop && !signal?.aborted) throw new StreamReadError(err);
+			throw err;
 		}
 	}
 
@@ -496,33 +803,15 @@ export class SessionModel {
 	 * lands on top. The stream then replays the turn from its first event
 	 * through the SAME consume path.
 	 */
-	async resumeStream(refetchRecordFirst = true): Promise<void> {
+	async resumeStream(refetchRecordFirst = true, allowRecovery = true, attempt = 0): Promise<void> {
+		// External reattachment supersedes unresolved POST preview ownership.
+		// Normal post-ack reattach keeps its preview until the atomic record swap.
+		this.retireImagePreview(this.imagePostOwner);
+		this.releaseImagePost(this.imagePostOwner);
 		this.consumeAbort?.abort();
 		const controller = new AbortController();
 		this.consumeAbort = controller;
-		this.setError(null);
-		for (let attempt = 0; ; attempt++) {
-			try {
-				await this.attachStream(refetchRecordFirst, controller);
-				return;
-			} catch (err) {
-				if (this.consumeAbort !== controller || controller.signal.aborted) return;
-				// Replay only GETs: the accepted learner input must never be resent.
-				if (isConnectionFailure(err) && attempt < 3) {
-					this.setStatus("submitted");
-					await delay(this.pollMs * 2 ** attempt, controller.signal).catch(() => {});
-					if (this.consumeAbort !== controller || controller.signal.aborted) return;
-					refetchRecordFirst = true;
-					continue;
-				}
-				this.setError((err as Error).message, isConnectionFailure(err));
-				this.setStatus("error");
-				return;
-			}
-		}
-	}
-
-	private async attachStream(refetchRecordFirst: boolean, controller: AbortController): Promise<void> {
+		this.latestRequest = controller;
 		// REPLAY ONTO A CLEAN SLATE (owner, optimistic round 3, 2026-10-02):
 		// the reattach stream replays the turn from its FIRST event — an
 		// aborted earlier attempt (React StrictMode's simulated remount)
@@ -547,49 +836,49 @@ export class SessionModel {
 			});
 		}
 		this.setStatus("submitted");
-
-		if (refetchRecordFirst) {
-			const recordRes = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}`, {
-				signal: controller.signal,
-			});
-			if (this.consumeAbort !== controller) return;
-			if (recordRes.status === 401 || recordRes.status === 403) {
-				throw new Error((await recordRes.text()) || "Phone access refused.");
-			}
-			if (recordRes.ok) {
-				const record = (await recordRes.json()) as { messages?: LhMessage[]; turnInFlight?: boolean };
+		try {
+			if (refetchRecordFirst) {
+				const record = await this.readRecord({ signal: controller.signal, allowInFlight: true, recoveringDrop: !allowRecovery, tolerateHttpFailure: true, isCurrent: () => this.consumeAbort === controller });
 				if (this.consumeAbort !== controller) return;
-				if (Array.isArray(record.messages)) {
+				if (!record) {
+					// The record did not land — restore the clean-slate guard
+					// before the replay (no atomic swap is coming).
 					this.mutate(() => {
-						this.base = record.messages!;
 						this.incompleteUsageIds.clear();
 						this.tail = [];
-					});
-					// A settled snapshot already contains the next question; no stream remains to replay.
-					if (record.turnInFlight === false) {
 						this.streamingMessageId = null;
-						this.setStatus("ready");
-						this.onReattachSettled?.();
-						return;
-					}
+					});
+				} else if (attempt > 0 && record.turnInFlight === false) {
+					// Reconnected after the turn settled: the snapshot already holds
+					// the next question, so there is no stream left to replay.
+					this.setStatus("ready");
+					this.onReattachSettled?.();
+					return;
 				}
-			} else {
-				// The record did not land — restore the clean-slate guard
-				// before the replay (no atomic swap is coming).
-				this.mutate(() => {
-					this.incompleteUsageIds.clear();
-					this.tail = [];
-					this.streamingMessageId = null;
-				});
 			}
+			const res = await this.fetchView(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, controller.signal, !allowRecovery);
+			if (this.consumeAbort !== controller) return;
+			if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
+			await this.consumeStream(res, controller, allowRecovery);
+		} catch (err) {
+			if (this.consumeAbort !== controller || controller.signal.aborted) return; // intentionally cancelled
+			// Replay only GETs: the accepted learner input is never resent.
+			if (isConnectionFailure(err) && attempt < this.reconnectAttempts) {
+				this.setStatus("submitted");
+				await delay(this.pollMs * 2 ** attempt, controller.signal).catch(() => {});
+				if (this.consumeAbort !== controller || controller.signal.aborted) return;
+				return this.resumeStream(true, false, attempt + 1);
+			}
+			this.retireImagePreview(this.imagePreview?.owner ?? null);
+			// A failed record read can leave the optimistic answer in the tail.
+			// Restore its Submit affordance; the next attempt reconciles first.
+			this.mutate(() => {
+				this.tail = this.tail.filter(m => !this.unconfirmedAnswers.has(m.id));
+				this.unconfirmedAnswers.clear();
+			});
+			this.setError(!allowRecovery && err instanceof StreamReadError ? STREAM_DROPPED : (err as Error).message, isConnectionFailure(err));
+			this.setStatus("error");
 		}
-		const res = await this.fetch(`/api/chats/${encodeURIComponent(this.chatId)}/stream`, {
-			signal: controller.signal,
-		});
-		if (this.consumeAbort !== controller) return;
-		if (!res.ok) throw new Error((await res.text()) || "Failed to attach to the running turn.");
-		await this.consumeStream(res, controller);
-
 	}
 
 	/**
@@ -598,34 +887,95 @@ export class SessionModel {
 	 * POST + consume. Ready-gated: one turn per client at a time (the
 	 * server's 409 + identity retry covers the wake-race window).
 	 */
-	async send(input: ChatInput): Promise<void> {
-		if (!this.readyRef) return;
+	async send(input: ChatInput, onAccepted?: () => void, questionKey?: string, onDeliverySettled?: () => void): Promise<boolean> {
+		let deliverySettled = false;
+		const settleDelivery = () => { if (!deliverySettled) { deliverySettled = true; onDeliverySettled?.(); } };
+		const refused = () => { settleDelivery(); return false; };
+		const recovering = this.statusValue === "error";
+		if (this.reconciliationValue !== "ready" || (!this.readyRef && !recovering)) return refused();
+		const pluginPending = pendingPluginQuestionOf(this.base);
+		if (!pluginPending && pluginQuestionCallsOf(this.base).some(call => call.status === "unreadable")) return refused();
+		if (pluginPending) {
+			if (this.pluginQuestionAvailability?.questionId !== pluginPending.questionId || this.pluginQuestionAvailability.status !== "available") return refused();
+			if (input.type !== "plugin-question-answer" || input.questionId !== pluginPending.questionId || !samePluginQuestionOccurrence(input.occurrence, pluginPending.occurrence)) return refused();
+		} else if (input.type === "plugin-question-answer") return refused();
+		if (input.type === "plugin-problem-submission") {
+			const active = activeProblemOf(this.base)?.pluginProblem, occurrence = activeProblemOccurrenceOf(this.base);
+			if (!active || active.problemId !== input.problemId || !occurrence || !samePluginQuestionOccurrence(occurrence, input.occurrence) ||
+				this.pluginProblemAvailability?.problemId !== active.problemId || this.pluginProblemAvailability.status !== "available") return refused();
+		}
+		if (input.type === "thinking" && activeProblemOf(this.base)?.pluginProblem) return refused();
+		const subject = input.type === "answer" ? pendingQuestionOf(this.nativeHistory()) : null;
+		// A render-scoped answer must not move to another occurrence sharing
+		// its id. This identity is local only; the server's wire is unchanged.
+		if (input.type === "answer" && questionKey !== undefined &&
+			(subject?.key !== questionKey || subject.toolCallId !== input.toolCallId)) return refused();
+		const expectedKey = questionKey ?? (input.type === "answer" && subject?.toolCallId === input.toolCallId ? subject.key : undefined);
+		const imageBearing = input.type === "text" || input.type === "thinking" ? !!input.images?.length
+			: input.type === "answer" ? Object.values(input.answer.images ?? {}).some(images => images?.length)
+				: (input.type === "plugin-question-answer" || input.type === "plugin-problem-submission") && Object.values(input.images ?? {}).some(images => images?.length);
+		this.retireImagePreview(this.imagePreview?.owner ?? null);
+		this.releaseImagePost(this.imagePostOwner);
 		this.consumeAbort?.abort();
 		const controller = new AbortController();
 		this.consumeAbort = controller;
+		this.latestRequest = controller;
+		this.evaluationOwner = (input.type === "plugin-question-answer" && pluginPending?.requiresGrading) ||
+			(input.type === "plugin-problem-submission" && activeProblemOf(this.base)?.pluginProblem?.requiresProcessing) ? controller : null;
 		this.setError(null);
 		this.setStatus("submitted");
+		if (recovering && input.type === "answer") {
+			try {
+				const record = await this.readRecord({ signal: controller.signal, allowInFlight: true, isCurrent: () => this.consumeAbort === controller });
+				if (this.consumeAbort !== controller || !record) return refused();
+				// No verified record/liveness: retain the draft and never guess
+				// whether a lost acknowledgement meant the input was accepted.
+				if (!Array.isArray(record.messages) || typeof record.turnInFlight !== "boolean") throw new Error("An error occurred.");
+				if (record.turnInFlight) {
+					settleDelivery();
+					await this.resumeStream(false);
+					return false;
+				}
+				const current = pendingQuestionOf(record.messages);
+				if (current?.toolCallId !== input.toolCallId || (expectedKey !== undefined && current.key !== expectedKey)) {
+					// The call already resolved, or no longer owns the dock. Adopt
+					// truth, never POST that answer a second time.
+					this.setStatus("ready");
+					return refused();
+				}
+			} catch (err) {
+				if (this.consumeAbort !== controller || controller.signal.aborted) return refused();
+				this.setError((err as Error).message);
+				this.setStatus("error");
+				return refused();
+			}
+		}
+		if (input.type !== "continue") this.automaticContinuationBlocked = false;
 		// The optimistic appends — exactly the messages the server's
 		// write-ahead will persist (inputAppends), with LOCAL ids so
 		// adoption can tell them from the record's absorbed copies.
 		const optimistic: LhMessage[] = [];
-		if (input.type === "text") optimistic.push({ ...newUserMessage(input.text), id: localId() });
+		if (input.type === "text") optimistic.push({ ...newUserMessage(input.text, input.images), id: localId() });
 		else if (input.type === "thinking") {
 			// The practice submissions (2026-10-04): the marker lands
 			// optimistically — the card renders from its details the
 			// moment the button fires.
-			optimistic.push({ ...newThinkingMessage(input.problemCallId, input.text), id: localId() });
+			optimistic.push({ ...newThinkingMessage(input.problemCallId, input.text, input.images), id: localId() });
 		} else if (input.type === "next") {
 			// The move-on signal (owner round 16): the NEXT PROBLEM line
 			// renders the instant the chip/Enter fires.
 			optimistic.push({ ...newNextMessage(), id: localId() });
 		} else if (input.type === "answer") {
-			const tool = pendingCallTool([...this.base, ...this.tail], input.toolCallId) ?? "quiz";
-			optimistic.push({ ...newAnswerResult(input.toolCallId, tool, input.answer), id: localId() });
+			const tool = pendingCallTool(this.nativeHistory(), input.toolCallId) ?? "quiz";
+			const result = { ...newAnswerResult(input.toolCallId, tool, input.answer), id: localId() };
+			optimistic.push(result);
+			this.unconfirmedAnswers.set(result.id, expectedKey ?? input.toolCallId);
 		}
 		if (optimistic.length > 0) this.mutate(() => {
 			this.tail = [...this.tail, ...optimistic];
 		});
+		if (imageBearing) this.imagePreview = { owner: controller, ids: new Set(optimistic.map(message => message.id)) };
+		let accepted = false;
 		try {
 			// SUBMITS ARE NOT ABORTABLE BY VIEW TEARDOWN (owner, 2026-10-10 —
 			// the dead-session-start postmortem): the POST must NOT ride
@@ -635,22 +985,44 @@ export class SessionModel {
 			// the page's sentInitial guard had already flipped), leaving the
 			// session dead until a second message, which then persisted
 			// WITHOUT the first — the optimistic tail rode a record that never
-			// contained it. The POST is a ~100ms ack since Diet B; it cannot
-			// starve the connection pool, so it needs no teardown guard. The
+			// contained it. Usually the POST is a short Diet B ack. A graded
+			// plugin answer instead awaits grading and save (accepted connection
+			// contention), but still must not inherit view teardown. The
 			// STREAM consume stays on the controller — releasing that held
 			// connection is Diet A's whole job.
-			const res = await this.postInputEvent(input);
+			let res: Response;
+			try {
+				res = await this.postInputEvent(input, undefined, imageBearing ? pending => this.imagePostPending(controller, pending) : undefined);
+			} finally {
+				// The response follows optional processing and save. A detached or
+				// superseded request must never clear its successor's label.
+				if (this.evaluationOwner === controller) this.mutate(() => { this.evaluationOwner = null; });
+			}
 			if (res.status === 409) {
-				this.setError("A turn is already running — try again in a moment.");
-				this.setStatus("error");
-				return;
+				settleDelivery();
+				throw new Error("A turn is already running — try again in a moment.");
 			}
 			if (!res.ok) {
-				// Refusal envelopes (503 BYOK/key gates) and 400s: the RAW body
-				// text rides the error message — the banner shows it, and the
-				// page's refusal flow JSON-parses the envelope out of it.
-				throw new Error((await res.text()) || `The send failed (${res.status}).`);
+				settleDelivery();
+				// Keep model/key refusal envelopes verbatim: the page's refusal
+				// flow parses them. Retry's 400s are ordinary user-facing
+				// guidance, so show their error text without JSON syntax.
+				let message = (await res.text()) || `The send failed (${res.status}).`;
+				if ((input.type === "retry" || input.type === "retry-question") && res.status === 400) {
+					try {
+						const refusal = JSON.parse(message) as { error?: unknown } | null;
+						if (typeof refusal?.error === "string" && refusal.error.length > 0) message = refusal.error;
+					} catch { /* Non-envelope failures keep their original text. */ }
+				}
+				throw new Error(message);
 			}
+			accepted = true;
+			// Acceptance fences reads belonging to THIS action, but a delayed
+			// detached POST cannot invalidate a replacement stream's terminal GET.
+			if (this.latestRequest === controller) this.invalidateCanonicalReads();
+			// Opening-message handover ends at acceptance, not stream completion.
+			onAccepted?.();
+			settleDelivery();
 			// CONNECTION DIET B (owner, 2026-10-10 — parallel-session freeze
 			// postmortem): the POST acknowledges and closes; there is no stream
 			// on this response to consume. Attach through the SAME reattach wire
@@ -662,12 +1034,44 @@ export class SessionModel {
 			// A stop() or a newer send/consume won while the ack was in
 			// flight: the turn is live server-side either way — do not attach
 			// a stream from a view that is gone or superseded.
-			if (this.consumeAbort !== controller) return;
+			if (this.consumeAbort !== controller) return true;
 			await this.resumeStream(true);
+			return true;
 		} catch (err) {
-			if ((err as Error).name === "AbortError") return; // stop() or a newer consume won
+			settleDelivery();
+			if (imageBearing && !accepted) this.retireImagePreview(controller);
+			const failedOpening = input.type === "text" && onAccepted !== undefined && !accepted;
+			if (failedOpening) {
+				// The POST outlives stop(), including StrictMode's cleanup. Remove
+				// only its own failed optimistic bubble even if a newer request
+				// won; never touch canonical messages or another attempt's tail.
+				const ids = new Set(optimistic.map(m => m.id));
+				this.mutate(() => { this.tail = this.tail.filter(m => !ids.has(m.id)); });
+			}
+			const detachedOpening = failedOpening && this.consumeAbort === null && this.latestRequest === controller;
+			if ((this.consumeAbort !== controller || controller.signal.aborted) && !detachedOpening) return accepted;
+			// A detached opening refusal must still reach the replayed mount's
+			// existing setup recovery. A newer send/reattach ALWAYS owns errors
+			// and status instead, even if that request has since been stopped.
+			// Ordinary text and answer teardown behavior stays unchanged.
+			if (input.type === "answer") {
+				const ids = new Set(optimistic.map(m => m.id));
+				this.mutate(() => {
+					this.tail = this.tail.filter(m => !ids.has(m.id));
+					for (const id of ids) this.unconfirmedAnswers.delete(id);
+				});
+			}
 			this.setError((err as Error).message);
 			this.setStatus("error");
+			if (imageBearing && !accepted && this.latestRequest === controller) {
+				// Refusal and lost acknowledgment both reconcile read-only. Canonical
+				// truth is not an acceptance notification and never clears drafts.
+				await this.readRecord({ allowInFlight: true, isCurrent: () => this.latestRequest === controller && (this.consumeAbort === controller || detachedOpening) }).catch(() => {});
+			}
+			// true means we observed this POST's acknowledgment. false does
+			// NOT prove non-delivery: a network failure may hide acceptance.
+			// Opening-message callers restore a draft, never automatically retry.
+			return accepted;
 		}
 	}
 
@@ -683,9 +1087,12 @@ export class SessionModel {
 	 *  settled mid-send (the race): fall back to the plain text send —
 	 *  the entry is dropped and send() pushes its own optimistic card.
 	 */
-	async steer(text: string): Promise<void> {
+	async steer(text: string, images?: import("../src/core/plugin-submissions.ts").PluginSubmissionContent["images"], onAccepted?: () => void, onDeliverySettled?: () => void): Promise<boolean> {
+		let deliverySettled = false;
+		const settleDelivery = () => { if (!deliverySettled) { deliverySettled = true; onDeliverySettled?.(); } };
 		const t = text.trim();
-		if (!t) return;
+		if (!t && !images?.length) { settleDelivery(); return false; }
+		this.invalidateCanonicalReads();
 		const id = `steer_${localId()}`;
 		this.steerQueueValue = [...this.steerQueueValue, { id, text: t }];
 		this.onChange?.();
@@ -697,27 +1104,28 @@ export class SessionModel {
 			const res = await this.fetch(`/api/chats/${this.chatId}/steer`, {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ input: { type: "steer", id, text: t } }),
+				body: JSON.stringify({ input: { type: "steer", id, text: t, ...(images?.length ? { images } : {}) } }),
 			});
-			if (res.ok) return; // parked or delivered — the stream lands the card
+			if (res.ok) { this.invalidateCanonicalReads(); onAccepted?.(); settleDelivery(); await res.text().catch(() => {}); return true; } // parked or delivered — the stream lands the card
 			if (res.status === 409) {
 				dropSteer();
-				await this.send({ type: "text", text: t }); // the settle race: plain send
-				return;
+				return await this.send({ type: "text", text: t, ...(images?.length ? { images: images.map(image => ({ ...image })) } : {}) }, onAccepted, undefined, settleDelivery); // reuse the prepared payload
 			}
 			dropSteer();
+			settleDelivery();
 			this.setError((await res.text()) || `The steer failed (${res.status}).`);
 		} catch (err) {
-			dropSteer();
+			dropSteer(); settleDelivery();
 			this.setError((err as Error).message);
 		}
+		return false;
 	}
 
 	/** The answer path (the dock): the answer IS the question call's tool
 	 *  result (fork 1), riding as its input event. */
-	submitAnswer(tool: string, toolCallId: string, output: QuestionAnswerData): Promise<void> {
+	submitAnswer(tool: string, toolCallId: string, output: QuestionAnswerData, questionKey?: string): Promise<void> {
 		void tool;
-		return this.send({ type: "answer", toolCallId, answer: output });
+		return this.send({ type: "answer", toolCallId, answer: output }, undefined, questionKey).then(() => undefined);
 	}
 
 	/** The dismissal path (owner design 2026-10-03, "A2"): the skipped
@@ -726,9 +1134,12 @@ export class SessionModel {
 	 * user's choice; the next plain send is the wake. On failure the
 	 * durable record wins: the error surfaces, the record-changed sync
 	 * (or any later refetch) replaces the optimistic append with truth. */
-	async dismissQuestion(toolCallId: string, answer: QuestionAnswerData): Promise<void> {
-		if (!this.readyRef) return;
-		const tool = pendingCallTool([...this.base, ...this.tail], toolCallId) ?? "quiz";
+	async dismissQuestion(toolCallId: string, answer: QuestionAnswerData, questionKey?: string): Promise<void> {
+		if (!this.readyRef || pluginQuestionCallsOf(this.base).some(call => call.status === "answerable" || call.status === "unreadable")) return;
+		const subject = pendingQuestionOf(this.nativeHistory());
+		if (questionKey !== undefined && (subject?.key !== questionKey || subject.toolCallId !== toolCallId)) return;
+		const tool = pendingCallTool(this.nativeHistory(), toolCallId) ?? "quiz";
+		this.invalidateCanonicalReads();
 		this.mutate(() => {
 			this.tail = [...this.tail, { ...newAnswerResult(toolCallId, tool, answer), id: localId() }];
 		});
@@ -739,6 +1150,7 @@ export class SessionModel {
 				body: JSON.stringify({ input: { type: "dismiss", toolCallId, answer } }),
 			});
 			if (!res.ok) throw new Error(`The dismissal failed (${res.status}).`);
+			this.invalidateCanonicalReads();
 		} catch (err) {
 			this.setError((err as Error).message);
 		}
@@ -750,6 +1162,7 @@ export class SessionModel {
 	 *  returns; the conclude synthesis rides the user's next input. */
 	async dismissProblem(problemCallId: string): Promise<void> {
 		if (!this.readyRef) return;
+		this.invalidateCanonicalReads();
 		this.mutate(() => {
 			this.tail = [...this.tail, { ...newProblemDismissedMarker(problemCallId), id: localId() }];
 		});
@@ -760,6 +1173,7 @@ export class SessionModel {
 				body: JSON.stringify({ input: { type: "dismiss-problem", problemCallId } }),
 			});
 			if (!res.ok) throw new Error(`The dismissal failed (${res.status}).`);
+			this.invalidateCanonicalReads();
 		} catch (err) {
 			this.setError((err as Error).message);
 		}
@@ -768,6 +1182,10 @@ export class SessionModel {
 	/** Local detach: cancel the consume, keep the partial tail. The page's
 	 *  settle watch adopts the record when the server turn finishes. */
 	stop(): void {
+		this.connectionGeneration++;
+		this.retireImagePreview(this.imagePreview?.owner ?? null);
+		this.releaseImagePost(this.imagePostOwner);
+		this.invalidateCanonicalReads();
 		this.consumeAbort?.abort();
 		this.consumeAbort = null;
 		this.streamingIds = new Set();
@@ -776,18 +1194,55 @@ export class SessionModel {
 		this.setStatus("ready");
 	}
 
+	/** Submission snapshots outlive the dock, not the session mount. */
+	questionDraft(questionKey: string): QuestionDraft | undefined {
+		return this.questionDrafts.get(questionKey);
+	}
+
+	saveQuestionDraft(questionKey: string, draft: Partial<QuestionDraft>): void {
+		this.questionDrafts.set(questionKey, { ...this.questionDrafts.get(questionKey), ...draft });
+	}
+
+	private forgetResolvedDrafts(record: readonly LhMessage[]): void {
+		const pendingKey = pendingQuestionOf(record)?.key;
+		for (const key of this.questionDrafts.keys()) {
+			if (key !== pendingKey) this.questionDrafts.delete(key);
+		}
+		for (const [id, key] of this.unconfirmedAnswers) {
+			if (key !== pendingKey) this.unconfirmedAnswers.delete(id);
+		}
+	}
+
 	/** Full snapshot swap (the idle settle sync — server canon). */
-	setMessages(record: LhMessage[]): void {
+	setMessages(record: LhMessage[], turnError?: string, availability?: PluginQuestionAvailability, problemAvailability?: PluginProblemAvailability): void {
+		if (this.connectionError) {
+			// The link is back and the saved lesson is in hand: the reconnect error is stale.
+			this.setError(null);
+			this.setStatus("ready");
+		}
+		this.invalidateCanonicalReads();
+		this.replaceMessages(record, turnError, availability, problemAvailability);
+	}
+
+	private replaceMessages(record: LhMessage[], turnError?: string, availability?: PluginQuestionAvailability, problemAvailability?: PluginProblemAvailability): void {
+		if (this.imagePostOwner) return;
+		record = copyImmutableData(record);
 		this.mutate(() => {
-			if (this.connectionError) {
-				this.errorValue = null;
-				this.connectionError = false;
-				this.statusValue = "ready";
-				this.readyRef = true;
-			}
 			this.base = record;
+			this.pluginQuestionAvailability = availability;
+			this.pluginProblemAvailability = problemAvailability;
+			const problemId = activeProblemOf(record)?.pluginProblem?.problemId;
+			for (const key of this.pluginProblemDrafts.keys()) if (key !== problemId) this.pluginProblemDrafts.delete(key);
+			if (turnError !== undefined) {
+				this.errorValue = { message: turnError };
+				this.automaticContinuationBlocked = true;
+			}
+			this.forgetResolvedDrafts(record);
+			const pluginKeys = new Set(pluginQuestionCallsOf(record).map(call => pluginQuestionOccurrenceKey(call.occurrence)));
+			for (const key of this.pluginQuestionDrafts.keys()) if (!pluginKeys.has(key)) this.pluginQuestionDrafts.delete(key);
 			this.incompleteUsageIds.clear();
 			this.tail = [];
+			this.imagePreview = null;
 			this.streamingMessageId = null; // the tail (and its slot) is gone
 		});
 	}
@@ -795,18 +1250,36 @@ export class SessionModel {
 	/**
 	 * Append-only adoption (the mid-turn steer/artifact ground rule): swap
 	 * in the record — every current base message must still be present
-	 * (the server appends only) — keeping the live tail, minus the
-	 * optimistic entries the record has absorbed (their server-stamped
-	 * copies just landed; without this the input bubble would double).
+	 * (the server appends only) — keeping the live tail, minus entries the
+	 * record already carries by id and optimistic entries it has absorbed
+	 * (their server-stamped copies just landed; without this messages double).
 	 */
 	adoptRecord(record: LhMessage[]): void {
+		this.invalidateCanonicalReads();
+		this.appendMessages(record);
+	}
+
+	private appendMessages(record: LhMessage[], availability?: PluginQuestionAvailability, updateAvailability = false, problemAvailability?: PluginProblemAvailability): boolean {
+		if (this.imagePostOwner) return false;
+		record = copyImmutableData(record);
 		const recordIds = new Set(record.map((m) => (m as { id?: string }).id));
 		const baseAbsorbed = this.base.some((m) => !recordIds.has((m as { id?: string }).id));
-		if (baseAbsorbed) return; // not a pure append — the idle full sync is the net
+		if (baseAbsorbed) return false; // not a pure append — the idle full sync is the net
 		this.mutate(() => {
 			this.base = record;
-			this.tail = this.tail.filter((m) => !absorbed(m, record));
+			if (updateAvailability) { this.pluginQuestionAvailability = availability; this.pluginProblemAvailability = problemAvailability; }
+			this.forgetResolvedDrafts(record);
+			this.tail = this.tail.filter((m) => !(typeof m.id === "string" && recordIds.has(m.id)) && !absorbed(m, record));
 		});
+		return true;
+	}
+
+	/** Automatic mount/sync continuation is never permission to retry a
+	 * failed turn. Read current model truth, not a stale React closure. */
+	async continueIfOwed(record: readonly LhMessage[]): Promise<void> {
+		if (this.readyRef && !this.automaticContinuationBlocked && this.getState().error === null && needsContinuation(record)) {
+			await this.send({ type: "continue" });
+		}
 	}
 
 	/** The mount/sync continuation fold (native-messages.ts). */

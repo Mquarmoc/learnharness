@@ -27,7 +27,8 @@ import { deriveView, getGraph, graphSnapshot, mergeFindings, type GraphDeps } fr
 import { coverageSlots } from "../src/core/coverage.ts";
 import { graphStore } from "../src/store/graph.ts";
 import { chatStore } from "../src/store/chats.ts";
-import { LEDGER_FILES, PATHS, SOURCES_FILE } from "../config.ts";
+import { GRAPH_FORMAT_FILE, LEDGER_FILES, PATHS, SOURCES_FILE } from "../config.ts";
+import { CURRENT_GRAPH_FORMAT_VERSION } from "../src/core/contracts/graph.ts";
 
 /** The wired fs adapters, exactly what src/server/stores.ts passes in production. */
 const graphDeps = { chatStore, graphStore } as const satisfies GraphDeps;
@@ -476,6 +477,104 @@ describe("the merger (mergeFindings)", () => {
 		assert.equal(snap.sessions["src_snapfixture"], undefined, "a notes source is never a chat session");
 	});
 
+	it("reads the sources map once per snapshot, however many notes sources the graph names", () => {
+		const ids = ["src_snaponce_a", "src_snaponce_b", "src_snaponce_c"];
+		for (const [i, id] of ids.entries()) {
+			graphStore.upsertSource({ id, filePath: `/vault/once ${i}.md`, importedAt: "2026-09-13T00:00:00.000Z" });
+			mergeFindings(
+				id,
+				{
+					propositions: [{ id: "p1", name: `Once ${i}`, statement: `Snapshot-once fixture proposition ${i}.`, aliases: [] }],
+					chains: [],
+				},
+				{ links: [] },
+				graphDeps,
+				{ foldedAt: "2026-09-13T00:00:00.000Z" },
+			);
+		}
+		let reads = 0;
+		const countingGraphStore = {
+			...graphStore,
+			readSources: () => {
+				reads++;
+				return graphStore.readSources();
+			},
+		};
+		const deps = { chatStore, graphStore: countingGraphStore };
+		const snap = graphSnapshot(deps);
+		for (const [i, id] of ids.entries()) {
+			assert.equal(snap.fileSources[id], `/vault/once ${i}.md`);
+			const node = snap.nodes.find((node) => node.name === `Once ${i}`)!;
+			assert.deepEqual(snap.nodeSessions[node.id], [id], "resolved files retain their provenance links");
+		}
+		assert.equal(reads, 1, "sources.json is read once, not once per notes source");
+
+		graphStore.upsertSource({ id: ids[0]!, filePath: "/vault/updated path.md", importedAt: "2026-09-14T00:00:00.000Z" });
+		const next = graphSnapshot(deps);
+		assert.equal(reads, 2, "the next snapshot reads again, rather than reusing a persistent cache");
+		assert.equal(next.fileSources[ids[0]!], "/vault/updated path.md", "the next snapshot sees current source metadata");
+		assert.equal(snap.fileSources[ids[0]!], "/vault/once 0.md", "the previous snapshot remains unchanged");
+	});
+
+	it("preserves chat precedence and omits unknown sources when resolving mixed provenance", () => {
+		const ids = [chat1.id, "src_mixed_notes", "src_mixed_unknown"];
+		const nodes: GraphNode[] = ids.map((chatId, i) => ({
+			id: `n_mixed_${i}`, name: `Mixed ${i}`, statement: `Mixed provenance ${i}`, aliases: [],
+			createdAt: "2026-09-13T00:00:00.000Z", provenance: [{ chatId, messageId: "m1" }],
+		}));
+		let reads = 0;
+		const snap = graphSnapshot({ chatStore, graphStore: {
+			...graphStore,
+			readNodes: () => nodes,
+			readChains: () => [],
+			readPositions: () => ({}),
+			readSources: () => {
+				reads++;
+				return [
+					{ id: chat1.id, filePath: "/vault/not-a-chat-title.md", importedAt: "fixture" },
+					{ id: "src_mixed_notes", filePath: "/vault/mixed notes.md", importedAt: "fixture" },
+				];
+			},
+		} });
+		assert.equal(reads, 1);
+		assert.deepEqual(snap.sessions, { [chat1.id]: "Graph fixture" });
+		assert.deepEqual(snap.fileSources, { src_mixed_notes: "/vault/mixed notes.md" });
+		assert.deepEqual(snap.nodeSessions, { n_mixed_0: [chat1.id], n_mixed_1: ["src_mixed_notes"] });
+	});
+
+	it("keeps empty and chat-only snapshots valid without imported sources", () => {
+		for (const chatOnly of [false, true]) {
+			const nodes: GraphNode[] = chatOnly ? [{
+				id: "n_chat_only", name: "Chat only", statement: "Chat-only fixture", aliases: [],
+				createdAt: "fixture", provenance: [{ chatId: chat1.id, messageId: "m1" }],
+			}] : [];
+			const snap = graphSnapshot({ chatStore, graphStore: {
+				...graphStore, readNodes: () => nodes, readChains: () => [], readPositions: () => ({}), readSources: () => [],
+			} });
+			assert.deepEqual(snap.fileSources, {});
+			assert.deepEqual(snap.sessions, chatOnly ? { [chat1.id]: "Graph fixture" } : {});
+			assert.deepEqual(snap.nodeSessions, chatOnly ? { n_chat_only: [chat1.id] } : {});
+			assert.deepEqual(snap.nodes, nodes);
+		}
+	});
+
+	it("refuses a newer graph format before resolving source paths and leaves stored bytes untouched", () => {
+		const original = fs.existsSync(GRAPH_FORMAT_FILE) ? fs.readFileSync(GRAPH_FORMAT_FILE) : null;
+		const newer = Buffer.from(JSON.stringify({ version: CURRENT_GRAPH_FORMAT_VERSION + 1 }));
+		fs.writeFileSync(GRAPH_FORMAT_FILE, newer);
+		let sourceReads = 0;
+		try {
+			assert.throws(() => graphSnapshot({ chatStore, graphStore: {
+				...graphStore, readSources: () => { sourceReads++; return graphStore.readSources(); },
+			} }), /older than its data/);
+			assert.equal(sourceReads, 0, "the existing node-read guard still refuses before the new lookup map is built");
+			assert.deepEqual(fs.readFileSync(GRAPH_FORMAT_FILE), newer, "snapshot reads never rewrite the format stamp");
+		} finally {
+			if (original === null) fs.rmSync(GRAPH_FORMAT_FILE);
+			else fs.writeFileSync(GRAPH_FORMAT_FILE, original);
+		}
+	});
+
 	it("derives BIRTH-SESSION clusters in graphSnapshot, labeled with the session's name", () => {
 		// Wave 7 (owner-locked 2026-09-23): embeddings are dead — a cluster is
 		// the session that BIRTHED its propositions, derived on read from
@@ -510,7 +609,7 @@ describe("the merger (mergeFindings)", () => {
 		const mine = snap.clusters.find((c) => c.members.length === 3 && tri.every((s) => c.members.includes(snap.nodes.find((n) => n.statement === s)!.id)));
 		assert.ok(mine, "the trio is one cluster");
 		assert.equal(mine!.id, "src_clusterfixture");
-		assert.equal(mine!.label, "/vault/cluster notes.md", "a notes file is a birth-session — the label is its path");
+		assert.equal(mine!.label, "cluster notes", "a notes file label is its exact filename minus extension");
 
 		// Chains-primary split (owner, 2026-09-30): `nodes` is the canvas
 		// image, `propositions` the stored truth alone (the chain table's
@@ -657,6 +756,7 @@ describe("graph ledger store", () => {
 
 import { deleteChatTraces, type ChatDeletionStats } from "../src/core/graph-deletion.ts";
 import { deleteChatSession, sessionCoverage } from "../src/server/chats.ts";
+import { rememberTurnFailure, settledTurnResponse } from "../src/server/turn-runs.ts";
 import { beginTurn, endTurn } from "../src/server/turn-liveness.ts";
 import { jobStore } from "../src/store/jobs.ts";
 import {
@@ -811,11 +911,13 @@ describe("session deletion (deleteChatTraces + deleteChatSession, wave 6)", () =
 		const turnedAway = await deleteChatSession(dA.id, "delete-nodes");
 		assert.deepEqual(turnedAway, { ok: false, status: 409, code: "turn_in_flight", error: "A turn is running in this session — try again when it finishes", jobIds: [] });
 		endTurn(dA.id);
-		// 409 — running background jobs.
+		// 409 — running background jobs; a refused delete keeps its notice.
+		rememberTurnFailure(dA.id, "The reply could not be saved.");
 		const job = jobStore.createJob({ kind: "research", chatId: dA.id, toolCallId: "del-call-1" });
 		const jobsBlocked = await deleteChatSession(dA.id, "delete-nodes");
 		assert.ok(!jobsBlocked.ok && jobsBlocked.status === 409, "refused with 409");
 		if (jobsBlocked.code === "jobs_running") assert.deepEqual(jobsBlocked.jobIds, [job.id]);
+		assert.match(await settledTurnResponse(dA.id).text(), /The reply could not be saved\./);
 		assert.equal(jobStore.deleteJobsForChat(dA.id), 1, "test cleanup — the job file is gone");
 
 		// Success — a terminal job rides along; the chat record dies last.
@@ -830,6 +932,7 @@ describe("session deletion (deleteChatTraces + deleteChatSession, wave 6)", () =
 			assert.ok(outcome.graphRevision > 0, "the version stamp moved");
 		}
 		assert.equal(chatStore.getChat(dA.id), null, "the chat record is gone");
+		assert.doesNotMatch(await settledTurnResponse(dA.id).text(), /"type":"error"/, "deletion clears its transient notice");
 		assert.equal(jobStore.getJob(doneJob.id), null, "the chat's job records are gone");
 		// And a second call is an honest 404.
 		assert.deepEqual(await deleteChatSession(dA.id, "delete-nodes"), { ok: false, status: 404, code: "not_found", error: "No such session" });

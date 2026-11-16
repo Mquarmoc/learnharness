@@ -3,10 +3,13 @@ import type { SearchProvider } from "../../core/search.ts";
 import {
 	accumulateJobUsage,
 	buildSubagentSteer,
+	isSubagentFailure,
+	isWebSourceUrl,
 	piUsageToStep,
+	isBuiltinJobKind,
 	type DemoResult,
 	type DemoToolInput,
-	type JobKind,
+	type BuiltinJobKind,
 	type JobRecord,
 	type JobUsage,
 	type PdfResult,
@@ -29,6 +32,7 @@ import { runDemoBuilder } from "./demo-builder.ts";
 import { runPdfReaderAgent } from "./pdf-reader.ts";
 import { runResearcherAgent } from "./researcher.ts";
 import { runVisualMaker } from "./visual-maker.ts";
+import { loadLearnerImage, type LearnerImage } from "../tools/learner-image.ts";
 
 /**
  * The background job runner (contracts.ts "THE ASYNC PROTOCOL" §2–3), created
@@ -40,13 +44,13 @@ import { runVisualMaker } from "./visual-maker.ts";
  *     (the job tools' execute fires this via the spawn seam, fire-and-forget),
  *     updating the job's activity line on every iteration. On completion the
  *     runner builds the STEER MESSAGE (buildSubagentSteer) and hands it to
- *     `deliver`; the wake pipeline fires the server-side teacher turn and
- *     flips the job to done/error when the lesson has actually resumed.
+ *     `deliver` without waiting. The worker's final outcome and pending
+ *     delivery are saved together; the session owns delivery from then on.
  *
  *   On failure the result is the failure shape (empty html/svg + "FAILED: …"
  *   notes; research: failure brief) — and it STILL steers, because the
- *   teacher must learn the outcome. If delivery itself fails, the job is
- *     marked error (the learner's activity card shows it).
+ *   teacher must learn the outcome. Failed delivery starts stay quietly
+ *   pending and never rewrite the worker's computation outcome.
  */
 
 /**
@@ -67,9 +71,9 @@ export interface JobRunnerDeps {
 	chatStore: ChatStore;
 	jobStore: JobStore;
 	/**
-	 * Hand a finished job's steer to the wake pipeline — resolves when the
-	 * steer is delivered (the wake turn completed and the job status
-	 * flipped); rejects when delivery fails unrecoverably.
+	 * Hand a finished job's steer to the session delivery registry. The
+	 * promise tracks durable marker acceptance, but the worker never waits
+	 * on it. Its persisted pending obligation survives process restart.
 	 */
 	deliver: (steer: SteerMessage) => Promise<void>;
 	/** Settings-resolved engine per role (model slots wave, 2026-09-20):
@@ -96,8 +100,8 @@ export interface JobRunnerDeps {
 export interface JobRunner {
 	/** Run one job's sub-agent loop to completion (background; never throws).
 	 *  The tool input rides along from dispatch (the spawn fires mid-stream,
-	 *  before the tool part is persisted — only crash-recovery re-spawns
-	 *  resolve the input from the transcript). */
+	 *  before the tool part is persisted). Recovery reads saved job input,
+	 *  with transcript fallback for legacy jobs. Delivery is not awaited. */
 	runJob(jobId: string, input?: JobToolInput): Promise<void>;
 }
 
@@ -117,7 +121,7 @@ interface LoopContext {
 
 /** The kind→role table (model slots wave, 2026-09-20): which ModelRole's
  * engine each sub-agent kind runs — the engineFor injection key. */
-const KIND_ROLE: Record<JobKind, ModelRole> = {
+const KIND_ROLE: Record<BuiltinJobKind, ModelRole> = {
 	research: "researcher",
 	demo: "demoBuilder",
 	visual: "visualMaker",
@@ -167,7 +171,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	 *  tests swap scripted engines without touching deps), then the injected
 	 *  settings-resolved engineFor. undefined = the BYOK chain came up
 	 *  empty (owner, 2026-09-22) — runJob refuses below, honestly. */
-	function pickEngine(kind: JobKind): PiEngine | undefined {
+	function pickEngine(kind: BuiltinJobKind): PiEngine | undefined {
 		const testOverride: Record<string, { current?: PiEngine } | undefined> = {
 			researcher: researchModelOverride,
 			demoBuilder: demoModelOverride,
@@ -178,7 +182,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	}
 
 	const KIND_RUNNERS: Record<
-		JobKind,
+		BuiltinJobKind,
 		(jobId: string, engine: PiEngine, input: JobToolInput | undefined, loop: LoopContext) => Promise<void>
 	> = {
 		research: (jobId, engine, input, loop) => runResearchJob(jobId, engine, input, loop),
@@ -193,7 +197,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 			console.error(`[job ${jobId}] not found — nothing to run`);
 			return;
 		}
-		if (job.status !== "running") return; // already finished / re-run after crash recovery
+		if (job.status !== "running" || !isBuiltinJobKind(job.kind)) return; // plugin tasks never enter the core runner
 		const run = KIND_RUNNERS[job.kind];
 		if (!run) {
 			console.error(`[job ${jobId}] unknown kind: ${job.kind}`);
@@ -270,14 +274,15 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		}
 	}
 
-	/** Resolve the job's tool input: dispatch passes it directly; only a
-	 *  crash-recovery re-spawn (no input) falls back to scanning the
-	 *  transcript (by then onFinish has long persisted the part). */
+	/** Dispatch input wins, then the job's saved arguments. Legacy jobs
+	 * without saved input fall back to the durable transcript, which may
+	 * lack a call if the dispatching turn died before settlement. */
 	function resolveInput(
 		job: JobRecord,
 		input: JobToolInput | undefined,
 	): JobToolInput | undefined {
 		if (input) return input;
+		if (job.input !== undefined) return job.input as JobToolInput;
 		const chat = chatStore.getChat(job.chatId);
 		if (!chat) return undefined;
 		// Wave D: the record is native history — the scan reads the native
@@ -295,27 +300,28 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 	}
 
 	/**
-	 * The tail of every job: store the result, build the steer, hand it to
-	 * the wake pipeline. The pipeline flips the status when the lesson has
-	 * actually resumed — until then the job reads "running" so the client's
-	 * activity card keeps polling and re-syncs once, at the end.
+	 * Save the computation outcome and session delivery obligation together.
+	 * Worker liveness ends after cleanup, not after a lesson consumes the result.
 	 */
 	async function finishJob(jobId: string, result: ResearchResult | DemoResult | VisualResult | PdfResult): Promise<void> {
 		const job = jobStore.getJob(jobId);
 		if (!job) return;
-		// Aborted mid-run or mid-delivery (abortJob flips the record before
+		// Aborted mid-run (abortJob flips the record before
 		// the loop unwinds): no result write, no steer — the abort path owns
 		// the record and queues the abort steer itself.
 		if (job.status !== "running") return;
-		jobStore.updateJob(jobId, { result, activity: "delivering result" });
-		const steer = buildSubagentSteer(job, result);
-		try {
-			await deliver(steer);
-		} catch (err) {
-			const reason = err instanceof Error ? err.message : String(err);
-			console.error(`[job ${jobId}] steer delivery failed:`, err);
-			jobStore.updateJob(jobId, { status: "error", error: reason, activity: "delivery failed" });
-		}
+		const failed = isSubagentFailure(job.kind, result);
+		jobStore.updateJob(jobId, {
+			result,
+			status: failed ? "error" : "done",
+			activity: failed ? "failed" : "finished",
+			delivery: { kind: "result", status: "pending" },
+		});
+		// The saved result now belongs to the session. Do not keep the worker,
+		// abort registration, or temporary resources alive behind a question.
+		void deliver(buildSubagentSteer(job, result)).catch((err: unknown) => {
+			console.error(`[job ${jobId}] pending delivery:`, err);
+		});
 	}
 
 	/** Chat-record + input resolution shared by all three runners. */
@@ -343,7 +349,12 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 		const { job } = ctx;
 
 		const input = (passedInput ?? resolveInput(job, passedInput)) as ResearchToolInput | undefined;
-		const question = typeof input?.question === "string" && input.question.trim() ? input.question : "(no question)";
+		if (!(typeof input?.question === "string" && input.question.trim())) {
+			jobStore.updateJob(jobId, { error: "research question unavailable" });
+			await finishJob(jobId, { brief: "Research failed: the research question is unavailable.", sources: [] });
+			return;
+		}
+		const question = input.question;
 		const context = typeof input?.context === "string" && input.context.trim() ? input.context : undefined;
 
 		const prompt = [
@@ -446,11 +457,19 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 
 		const input = (passedInput ?? resolveInput(job, passedInput)) as VisualToolInput | undefined;
 		const brief = typeof input?.brief === "string" ? input.brief : "";
+		const imagePath = typeof input?.image === "string" ? input.image : undefined;
 
 		try {
-			jobStore.updateJob(jobId, { activity: "drawing figure" });
+			// Annotation (issue #363): the learner image is read once, here,
+			// and rides into the maker bounded for storage.
+			let image: LearnerImage | undefined;
+			if (imagePath !== undefined) {
+				jobStore.updateJob(jobId, { activity: "loading image" });
+				image = await loadLearnerImage(imagePath, loop.abortSignal);
+			}
+			jobStore.updateJob(jobId, { activity: image ? "annotating image" : "drawing figure" });
 			const result = await runVisualMaker(
-				{ brief },
+				{ brief, image },
 				{
 					engine: model,
 					abortSignal: loop.abortSignal,
@@ -459,6 +478,7 @@ export function createJobRunner(deps: JobRunnerDeps): JobRunner {
 					onActivity: (line) => jobStore.updateJob(jobId, { activity: line }),
 				},
 			);
+			if (image && result.svg && stillRunning(jobId)) chatStore.saveImageSnapshot(job.chatId, image.snapshotId, image);
 			if (isVisualFailure(result) && stillRunning(jobId))
 				jobStore.updateJob(jobId, { error: result.notes ?? "visual build failed" });
 			await finishJob(jobId, result);
@@ -544,8 +564,10 @@ function hostOf(url: string | undefined): string {
 	}
 }
 
-/** Sources for the result: markdown links cited in the brief, else fetched URLs. */
-function parseSources(brief: string, fetchedUrls: string[]): ResearchResult["sources"] {
+/** Sources for the result: markdown links cited in the brief, else fetched
+ * URLs. Fetched URLs are recorded before the fetch tool validates their scheme;
+ * only http(s) sources may become links, including in previously saved jobs. */
+export function parseSources(brief: string, fetchedUrls: string[]): ResearchResult["sources"] {
 	const sources: ResearchResult["sources"] = [];
 	const seen = new Set<string>();
 	for (const match of brief.matchAll(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g)) {
@@ -557,7 +579,7 @@ function parseSources(brief: string, fetchedUrls: string[]): ResearchResult["sou
 	}
 	if (sources.length === 0) {
 		for (const url of fetchedUrls) {
-			if (seen.has(url)) continue;
+			if (seen.has(url) || !isWebSourceUrl(url)) continue;
 			seen.add(url);
 			sources.push({ title: hostOf(url), url });
 		}
