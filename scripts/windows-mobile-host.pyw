@@ -116,8 +116,6 @@ def main():
             "LH_DISABLE_AUTO_UPDATE": "1",
             "NEXT_TELEMETRY_DISABLED": "1",
         })
-        if config.get("fallbackModel"):
-            env["LH_FALLBACK_MODEL"] = config["fallbackModel"]
         log = runtime / "host.log"
         if log.exists() and log.stat().st_size > 2_000_000:
             log.replace(runtime / "host.previous.log")
