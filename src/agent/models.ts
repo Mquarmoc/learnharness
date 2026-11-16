@@ -15,8 +15,17 @@ import packageMetadata from "../../package.json" with { type: "json" };
 import { chatGPTModel } from "./chatgpt-bridge.ts";
 import { chatGPTStream } from "./chatgpt-stream.ts";
 import type { ChatGPTDispatchLifecycle } from "./chatgpt-request-cycle.ts";
-import { nativeSubscriptionId, nativeSubscriptionModel } from "./subscription-bridge.ts";
+import { nativeSubscriptionId, nativeSubscriptionModel, refreshSubscriptionModels } from "./subscription-bridge.ts";
 import { nativeSubscriptionStream } from "./subscription-stream.ts";
+import { withFallback } from "./fallback-stream.ts";
+
+/** Opt-in fallback for ChatGPT plan failures: LH_FALLBACK_MODEL="xai-subscription:grok-4.7".
+ *  Only another signed-in subscription connection qualifies, never an API key. */
+function chatGPTFallbackTarget(): { provider: string; id: string } | undefined {
+	const raw = process.env.LH_FALLBACK_MODEL ?? "", cut = raw.indexOf(":");
+	const provider = raw.slice(0, cut), id = raw.slice(cut + 1);
+	return cut > 0 && id && nativeSubscriptionId(provider) ? { provider, id } : undefined;
+}
 
 /** App identity is immutable and shared by Models and every native Agent.
  * Agent's default Pi attribution otherwise overrides the Models identity. */
@@ -119,7 +128,21 @@ export function piEngineForSpec(spec: ResolvedModelSpec, background: boolean | (
 		// the pin honest even when config or settings drift off the map.
 		streamFn: (requestModel, context, options) => {
 			const purpose = typeof background === "function" ? background : () => background;
-			const stream = spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
+			const target = spec.provider === "chatgpt" ? chatGPTFallbackTarget() : undefined;
+			if (target) {
+				// A turn the request cycle never admitted stays denied: fall back only once ChatGPT was actually asked.
+				let dispatched = !lifecycle;
+				const watched = lifecycle && { ...lifecycle, beforeDispatch: (scope: Parameters<ChatGPTDispatchLifecycle["beforeDispatch"]>[0]) => { lifecycle.beforeDispatch(scope); dispatched = true; } };
+				return withFallback(chatGPTStream(purpose, watched)(requestModel, context, { ...options, reasoning: level === "off" ? undefined : level }), () => dispatched, async () => {
+					await refreshSubscriptionModels();
+					const fallbackModel = nativeSubscriptionModel(target.provider, target.id);
+					if (!fallbackModel) return undefined;
+					const fallbackLevel = clampThinkingLevel(fallbackModel, level);
+					console.warn(`[models] ChatGPT failed; this call falls back to ${target.provider}:${target.id}`);
+					return nativeSubscriptionStream(models.getProvider(nativeSubscriptionId(target.provider)!)!, purpose)(fallbackModel, context, { ...options, reasoning: fallbackLevel === "off" ? undefined : fallbackLevel });
+				});
+			}
+			const stream =spec.provider === "chatgpt" ? chatGPTStream(purpose, lifecycle) : nativeId ? nativeSubscriptionStream(models.getProvider(nativeId)!, purpose, lifecycle) : models.streamSimple.bind(models);
 			return stream(requestModel, context, { ...options, reasoning: level === "off" ? undefined : level });
 		},
 	};
